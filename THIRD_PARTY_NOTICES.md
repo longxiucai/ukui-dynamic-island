@@ -22,7 +22,6 @@
 - 三形态几何常量（刘海 238×32 / 胶囊 196×32 / 指示条 56×4、inset、圆角与肩线）参考 **BrimDeck**（Apache-2.0，<https://github.com/MoFeng2223/BrimDeck>）的 `CollapsedGeometry`，按其许可证要求在此署名。
 - 五套皮肤的参数与命名参考 **岛仔 Daozai**（MIT，<https://github.com/Renly1994/xiaotang-daozai>），「悬浮云」皮肤原作者为 啵（@hanhb123）。上游 MIT 版权声明为 Copyright (c) 2026 小唐的Token and Daozai contributors。
 - 图标为本次项目自绘。
-- `references/` 是开发时的本地参考副本，不进入安装包。如果源码仓库保留该目录，需要同时保留两个项目各自的 LICENSE。
 
 ## 打包工具
 
