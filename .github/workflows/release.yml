@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Ubuntu 20.04
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            ubuntu:20.04 \
+            bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                python3 python3-venv python3-pip dpkg-dev binutils ca-certificates \
+                libgl1 libegl1 libdbus-1-3 libxkbcommon-x11-0 \
+                libxcb-cursor0 fonts-noto-cjk
+              ./packaging/build.sh
+              QT_QPA_PLATFORM=offscreen dist/ukui-island/ukui-island --self-test
+              QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/test_core.py
+              QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/smoke_offscreen.py
+            '
+
+      - name: Fix workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" .build-venv out build dist
+
+      - name: Upload amd64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ukui-island-amd64
+          path: |
+            out/*.deb
+            out/*.tar.gz
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+
+  arm64:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Debian bullseye arm64
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            debian:bullseye \
+            bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                python3 python3-venv python3-pip dpkg-dev binutils ca-certificates \
+                python3-pyside2.qtcore python3-pyside2.qtgui \
+                python3-pyside2.qtnetwork python3-pyside2.qtwidgets \
+                libgl1 libegl1 libdbus-1-3 libxkbcommon-x11-0 \
+                libxcb-cursor0 fonts-noto-cjk
+              ./packaging/build-arm64.sh
+              QT_QPA_PLATFORM=offscreen dist-arm64/ukui-island/ukui-island --self-test
+              QT_QPA_PLATFORM=offscreen .build-venv-arm64/bin/python tests/smoke_offscreen.py
+            '
+
+      - name: Fix workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" .build-venv-arm64 out-arm64 build-arm64 dist-arm64
+
+      - name: Upload arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ukui-island-arm64
+          path: |
+            out-arm64/*.deb
+            out-arm64/*.tar.gz
+            out-arm64/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    needs: [amd64, arm64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release assets
+        run: |
+          mkdir -p release-assets
+          cp artifacts/ukui-island-amd64/* release-assets/
+          cp artifacts/ukui-island-arm64/* release-assets/
+          rm -f release-assets/SHA256SUMS.txt
+          (cd release-assets && sha256sum ./* > SHA256SUMS.txt)
+          ls -lh release-assets
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber

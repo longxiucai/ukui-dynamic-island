@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=UKUI 灵动岛
+Name[en_US]=UKUI Island
+Comment=顶部灵动岛：时钟、电量、音量，悬停展开
+Comment[en_US]=Top-edge island: clock, battery, volume
+Exec=/opt/ukui-island/ukui-island
+Icon=ukui-island
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+StartupWMClass=ukui-island

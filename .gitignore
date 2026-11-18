@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+.DS_Store
+.build-venv/
+.build-venv-arm64/
+build/
+build-arm64/
+dist/
+dist-arm64/
+out/
+out-arm64/
+references/
+logs/
