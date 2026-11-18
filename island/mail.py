@@ -29,7 +29,7 @@ class _TimeoutIMAP4(imaplib.IMAP4):
         self._timeout = timeout
         super().__init__(host, port)
 
-    def _create_socket(self):
+    def _create_socket(self, timeout=None):
         host = None if not self.host else self.host
         return socket.create_connection((host, self.port), self._timeout)
 
@@ -39,7 +39,7 @@ class _TimeoutIMAP4SSL(imaplib.IMAP4_SSL):
         self._timeout = timeout
         super().__init__(host, port)
 
-    def _create_socket(self):
+    def _create_socket(self, timeout=None):
         host = None if not self.host else self.host
         sock = socket.create_connection((host, self.port), self._timeout)
         return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
