@@ -31,9 +31,9 @@
 
 ## 系统要求
 
-- 银河麒麟 V10 SP1，UKUI 桌面，X11 会话，x86_64。
-- 当前发布包只有 x86_64/amd64；arm64 构建脚本已加入，尚未在真机验证。
-- 已在 1920×1080 单屏上验证。其他分辨率和多屏环境未测试。
+- 银河麒麟 V10 SP1，UKUI 桌面，X11 会话，x86_64 或 arm64。
+- Releases 提供 amd64 和 arm64 两种 deb 与便携包；arm64 由 CI 构建并通过自检，尚未在 ARM 真机验证。
+- x86_64 已在 1920×1080 单屏上验证。其他分辨率和多屏环境未测试。
 - 音量控制需要 `pactl` 或 `amixer`。电池从 `/sys/class/power_supply` 读取。
 - 通知监听需要 `dbus-monitor`，全屏检测和毛玻璃探测需要 `xprop`。
 - NVIDIA GPU 监控需要 `nvidia-smi`，其他显卡不显示 GPU 数据。
@@ -43,7 +43,8 @@
 ### deb 包
 
 ```bash
-sudo dpkg -i ukui-dynamic-island_0.6.0_amd64.deb
+sudo dpkg -i ukui-dynamic-island_0.6.0_amd64.deb   # x86_64
+sudo dpkg -i ukui-dynamic-island_0.6.0_arm64.deb   # arm64
 sudo apt -f install
 ukui-dynamic-island
 ```
@@ -58,7 +59,8 @@ sudo apt remove ukui-dynamic-island
 
 ```bash
 mkdir -p ~/apps/ukui-dynamic-island
-tar -xzf ukui-dynamic-island-0.6.0-x86_64.tar.gz -C ~/apps/ukui-dynamic-island
+tar -xzf ukui-dynamic-island-0.6.0-x86_64.tar.gz -C ~/apps/ukui-dynamic-island   # x86_64
+tar -xzf ukui-dynamic-island-0.6.0-aarch64.tar.gz -C ~/apps/ukui-dynamic-island  # arm64
 ~/apps/ukui-dynamic-island/run.sh
 ```
 
@@ -72,7 +74,7 @@ python3 -m venv .venv
 .venv/bin/python run.py
 ```
 
-Python 3.8 是打包和验证使用的版本。系统缺少 Qt 运行库时，先安装 `libxcb-cursor0`、`libxkbcommon-x11-0`、`libgl1`、`libegl1`、`libdbus-1-3` 和 `fonts-noto-cjk`。
+Python 3.8 是打包和验证使用的版本。系统缺少 Qt 运行库时，先安装 `libxcb-cursor0`、`libxcb-xinerama0`、`libxkbcommon-x11-0`、`libgl1`、`libegl1`、`libdbus-1-3`、`libglib2.0-0`、`libgssapi-krb5-2` 和 `fonts-noto-cjk`。
 
 ## 构建
 
@@ -114,7 +116,7 @@ arm64 包在 `ubuntu-22.04-arm` runner 上用 Debian bullseye 的 PySide2 5.15.2
 - `out-arm64/ukui-dynamic-island-0.6.0-aarch64.tar.gz`
 - `out-arm64/SHA256SUMS.txt`
 
-发布流水线在 `.github/workflows/release.yml`。推 `v*` tag 后会同时构建 amd64 和 arm64，并创建 Release。arm64 job 需要仓库能用 `ubuntu-22.04-arm` runner。这条路径还没有在麒麟 ARM 真机上验证。
+发布流水线在 `.github/workflows/release.yml`。推 `v*` tag 后会同时构建 amd64 和 arm64，并创建 Release。arm64 job 使用 `ubuntu-22.04-arm` runner，已在 Debian bullseye arm64 环境通过自检和离屏冒烟测试，但还没有在麒麟 ARM 真机上验证。
 
 ## 使用
 
@@ -161,6 +163,7 @@ rm -rf ~/.config/ukui-dynamic-island ~/.local/state/ukui-dynamic-island
 以下项目还没验证：
 
 - 纯净系统。依赖列表来自开发机。
+- arm64 真机。arm64 包只在 CI 中完成构建、自检和离屏测试。
 - Wayland 会话、多屏和侧边停靠。
 - CalDAV 和部分在线额度。没有用真实账号完成联调，失败时会回退本地数据。
 - 连续运行 24 小时、内存曲线、代码签名和自动更新。
