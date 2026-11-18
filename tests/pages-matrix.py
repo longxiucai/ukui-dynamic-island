@@ -51,7 +51,7 @@ def main():
     win.productivity.record_clip("剪贴板测试")
     win.productivity.add_shelf("/etc/hosts")
     win.set_mail({"status": "ok", "error": "", "at": "12:30", "items": [
-        {"sender": "GitHub", "subject": "[ukui-island] code 482913",
+        {"sender": "GitHub", "subject": "[ukui-dynamic-island] code 482913",
          "date": "12:20", "code": "482913", "preview": ""},
         {"sender": "王工", "subject": "本周评审", "date": "12:10",
          "code": "", "preview": "明天下午三点开会"},

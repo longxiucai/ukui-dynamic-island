@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="ukui-island",
+    name="ukui-dynamic-island",
     debug=False,
     strip=False,
     upx=False,
@@ -34,5 +34,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="ukui-island",
+    name="ukui-dynamic-island",
 )

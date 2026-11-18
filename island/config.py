@@ -57,7 +57,7 @@ def _dir(env: str, fallback: str) -> Path:
 
 
 def config_dir() -> Path:
-    return _dir("UKUI_ISLAND_CONFIG_DIR", ".config/ukui-island")
+    return _dir("UKUI_ISLAND_CONFIG_DIR", ".config/ukui-dynamic-island")
 
 
 def config_path() -> Path:
@@ -65,7 +65,7 @@ def config_path() -> Path:
 
 
 def state_dir() -> Path:
-    return _dir("UKUI_ISLAND_STATE_DIR", ".local/state/ukui-island")
+    return _dir("UKUI_ISLAND_STATE_DIR", ".local/state/ukui-dynamic-island")
 
 
 def _clean(raw: dict) -> dict:

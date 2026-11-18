@@ -115,7 +115,7 @@ def window_title_state():
 
 
 def _cover_dir():
-    path = Path.home() / ".cache" / "ukui-island" / "covers"
+    path = Path.home() / ".cache" / "ukui-dynamic-island" / "covers"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -132,7 +132,7 @@ def art_path(url):
     if path.exists():
         return str(path)
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "ukui-island/0.1"})
+        request = urllib.request.Request(url, headers={"User-Agent": "ukui-dynamic-island/0.1"})
         with urllib.request.urlopen(request, timeout=4) as response:
             data = response.read(5_000_000)
         path.write_bytes(data)

@@ -193,7 +193,7 @@ class SettingsDialog(QDialog):
         version = QLabel(f"版本 {__version__}")
         version.setObjectName("hint")
         version.setToolTip(
-            "配置 ~/.config/ukui-island\n日志 ~/.local/state/ukui-island")
+            "配置 ~/.config/ukui-dynamic-island\n日志 ~/.local/state/ukui-dynamic-island")
         close = QPushButton("完成")
         close.setObjectName("primary")
         close.setDefault(True)

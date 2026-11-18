@@ -12,8 +12,8 @@
 
 ## LGPL 合规说明
 
-- Qt 与 PySide2 以**动态库**形式放在 `/opt/ukui-island/_internal/` 下，没有静态链接，也没有修改源码。
-- 用户可以用自己编译的同名 `.so` 覆盖 `/opt/ukui-island/_internal/` 下的文件（便携包为 `ukui-island/_internal/`）；程序不校验签名，替换后仍可启动。
+- Qt 与 PySide2 以**动态库**形式放在 `/opt/ukui-dynamic-island/_internal/` 下，没有静态链接，也没有修改源码。
+- 用户可以用自己编译的同名 `.so` 覆盖 `/opt/ukui-dynamic-island/_internal/` 下的文件（便携包为 `ukui-dynamic-island/_internal/`）；程序不校验签名，替换后仍可启动。
 - 对应源码：<https://code.qt.io/cgit/pyside/pyside-setup.git/> 与 <https://download.qt.io/official_releases/qt/5.15/>
 - 本程序自身代码不因链接 LGPL 库而必须开源；若修改了 Qt/PySide2 本体，修改部分需按 LGPLv3 提供。
 

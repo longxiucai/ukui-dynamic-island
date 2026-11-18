@@ -97,7 +97,7 @@ def _local_source(url):
 def _read_url(url, user="", password="", method="GET", data=None, headers=None,
               timeout=10):
     request = urllib.request.Request(url, data=data, method=method)
-    request.add_header("User-Agent", "ukui-island/0.5")
+    request.add_header("User-Agent", "ukui-dynamic-island/0.5")
     for key, value in (headers or {}).items():
         request.add_header(key, value)
     if user:

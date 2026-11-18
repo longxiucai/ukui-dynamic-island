@@ -168,5 +168,5 @@ island/
 .build-venv/bin/python tests/test_core.py
 QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/smoke_offscreen.py
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 tests/style-theme-matrix.py
-QT_QPA_PLATFORM=offscreen dist/ukui-island/ukui-island --self-test
+QT_QPA_PLATFORM=offscreen dist/ukui-dynamic-island/ukui-dynamic-island --self-test
 ```

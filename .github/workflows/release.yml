@@ -35,7 +35,7 @@ jobs:
                 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
                 libxrender1 libsm6 libice6 fonts-noto-cjk
               ./packaging/build.sh
-              QT_QPA_PLATFORM=offscreen dist/ukui-island/ukui-island --self-test
+              QT_QPA_PLATFORM=offscreen dist/ukui-dynamic-island/ukui-dynamic-island --self-test
               QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/test_core.py
               QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/smoke_offscreen.py
             '
@@ -46,7 +46,7 @@ jobs:
       - name: Upload amd64 artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ukui-island-amd64
+          name: ukui-dynamic-island-amd64
           path: |
             out/*.deb
             out/*.tar.gz
@@ -82,7 +82,7 @@ jobs:
                 libpython3.9-dev libgl1 libegl1 libglib2.0-0 libdbus-1-3 libgssapi-krb5-2 libxkbcommon-x11-0 \
                 libxcb-cursor0 fonts-noto-cjk
               ./packaging/build-arm64.sh
-              QT_QPA_PLATFORM=offscreen dist-arm64/ukui-island/ukui-island --self-test
+              QT_QPA_PLATFORM=offscreen dist-arm64/ukui-dynamic-island/ukui-dynamic-island --self-test
               QT_QPA_PLATFORM=offscreen .build-venv-arm64/bin/python tests/smoke_offscreen.py
             '
 
@@ -92,7 +92,7 @@ jobs:
       - name: Upload arm64 artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ukui-island-arm64
+          name: ukui-dynamic-island-arm64
           path: |
             out-arm64/*.deb
             out-arm64/*.tar.gz
@@ -112,8 +112,8 @@ jobs:
       - name: Assemble release assets
         run: |
           mkdir -p release-assets
-          cp artifacts/ukui-island-amd64/* release-assets/
-          cp artifacts/ukui-island-arm64/* release-assets/
+          cp artifacts/ukui-dynamic-island-amd64/* release-assets/
+          cp artifacts/ukui-dynamic-island-arm64/* release-assets/
           rm -f release-assets/SHA256SUMS.txt
           (cd release-assets && sha256sum ./* > SHA256SUMS.txt)
           ls -lh release-assets

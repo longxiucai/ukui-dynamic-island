@@ -10,7 +10,7 @@ class SingleInstance(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._name = f"ukui-island-{os.getuid()}"
+        self._name = f"ukui-dynamic-island-{os.getuid()}"
         self._server = None
 
     def acquire(self) -> bool:

@@ -84,7 +84,7 @@ def load_cache(max_age=900, place=None):
 def _fetch(place):
     base = os.environ.get("UKUI_ISLAND_WEATHER_URL", "https://wttr.in")
     url = f"{base}/{urllib.parse.quote(place)}?format=j1&lang=zh"
-    request = urllib.request.Request(url, headers={"User-Agent": "ukui-island/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "ukui-dynamic-island/0.1"})
     with urllib.request.urlopen(request, timeout=4) as response:
         return parse_current(json.loads(response.read().decode("utf-8")), place)
 

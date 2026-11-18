@@ -43,26 +43,26 @@
 ### deb 包
 
 ```bash
-sudo dpkg -i ukui-island_0.6.0_amd64.deb
+sudo dpkg -i ukui-dynamic-island_0.6.0_amd64.deb
 sudo apt -f install
-ukui-island
+ukui-dynamic-island
 ```
 
 安装后可以从应用菜单打开「UKUI 灵动岛」。卸载命令：
 
 ```bash
-sudo apt remove ukui-island
+sudo apt remove ukui-dynamic-island
 ```
 
 ### 便携包
 
 ```bash
-mkdir -p ~/apps/ukui-island
-tar -xzf ukui-island-0.6.0-x86_64.tar.gz -C ~/apps/ukui-island
-~/apps/ukui-island/run.sh
+mkdir -p ~/apps/ukui-dynamic-island
+tar -xzf ukui-dynamic-island-0.6.0-x86_64.tar.gz -C ~/apps/ukui-dynamic-island
+~/apps/ukui-dynamic-island/run.sh
 ```
 
-便携包里的 `install.sh` 会安装到 `~/.local/share/ukui-island`，并在 `~/.local/bin` 和用户应用菜单里创建入口。
+便携包里的 `install.sh` 会安装到 `~/.local/share/ukui-dynamic-island`，并在 `~/.local/bin` 和用户应用菜单里创建入口。
 
 ### 从源码运行
 
@@ -83,21 +83,21 @@ ls -lh out/
 
 脚本会创建 `.build-venv`，安装 PySide2 5.15.2.1、PyInstaller 6.11.1 和 jeepney，然后生成：
 
-- `out/ukui-island_0.6.0_amd64.deb`
-- `out/ukui-island-0.6.0-x86_64.tar.gz`
+- `out/ukui-dynamic-island_0.6.0_amd64.deb`
+- `out/ukui-dynamic-island-0.6.0-x86_64.tar.gz`
 - `out/SHA256SUMS.txt`
 
-打包目录在 `dist/ukui-island/`，可以直接运行自检：
+打包目录在 `dist/ukui-dynamic-island/`，可以直接运行自检：
 
 ```bash
-QT_QPA_PLATFORM=offscreen dist/ukui-island/ukui-island --self-test
+QT_QPA_PLATFORM=offscreen dist/ukui-dynamic-island/ukui-dynamic-island --self-test
 ```
 
 发布前检查：
 
-1. `dpkg-deb -I out/ukui-island_0.6.0_amd64.deb` 的 `Depends` 与 `ldd dist/ukui-island/ukui-island` 的结果对得上。
-2. 从解包后的 `/opt/ukui-island` 目录运行 `--self-test`，不要只跑 `dist/`。
-3. 在没有 `~/.config/ukui-island` 的账户下启动一次。
+1. `dpkg-deb -I out/ukui-dynamic-island_0.6.0_amd64.deb` 的 `Depends` 与 `ldd dist/ukui-dynamic-island/ukui-dynamic-island` 的结果对得上。
+2. 从解包后的 `/opt/ukui-dynamic-island` 目录运行 `--self-test`，不要只跑 `dist/`。
+3. 在没有 `~/.config/ukui-dynamic-island` 的账户下启动一次。
 4. 把 deb、tar.gz 和 `SHA256SUMS.txt` 一起上传到 Releases。
 
 ### ARM
@@ -110,8 +110,8 @@ arm64 包在 `ubuntu-22.04-arm` runner 上用 Debian bullseye 的 PySide2 5.15.2
 
 产物在 `out-arm64/`：
 
-- `out-arm64/ukui-island_0.6.0_arm64.deb`
-- `out-arm64/ukui-island-0.6.0-aarch64.tar.gz`
+- `out-arm64/ukui-dynamic-island_0.6.0_arm64.deb`
+- `out-arm64/ukui-dynamic-island-0.6.0-aarch64.tar.gz`
 - `out-arm64/SHA256SUMS.txt`
 
 发布流水线在 `.github/workflows/release.yml`。推 `v*` tag 后会同时构建 amd64 和 arm64，并创建 Release。arm64 job 需要仓库能用 `ubuntu-22.04-arm` runner。这条路径还没有在麒麟 ARM 真机上验证。
@@ -121,27 +121,27 @@ arm64 包在 `ubuntu-22.04-arm` runner 上用 Debian bullseye 的 PySide2 5.15.2
 - 鼠标移到岛上展开，移开收起。展开后可用左右箭头、底部页码豆或滚轮切页。
 - 点击托盘图标切换展开状态；右键打开皮肤、形态、开机自启、鼠标穿透和退出菜单。
 - 设置窗口可改皮肤、形态、时间格式、天气城市、邮件、日历和额度。
-- `ukui-island --version` 输出版本，`ukui-island --self-test` 输出 JSON 自检结果。
+- `ukui-dynamic-island --version` 输出版本，`ukui-dynamic-island --self-test` 输出 JSON 自检结果。
 
 ## 数据与卸载
 
 | 内容 | 位置 |
 | --- | --- |
-| 配置 | `~/.config/ukui-island/config.json`（0600） |
-| 待办、饮水、剪贴板、置物架 | `~/.local/state/ukui-island/productivity.json`（0600） |
-| 日志 | `~/.local/state/ukui-island/island.log` |
-| 开机自启 | `~/.config/autostart/ukui-island.desktop`（仅勾选时创建） |
-| 已连接账号的令牌 | `~/.config/ukui-island/*.json`（0600） |
+| 配置 | `~/.config/ukui-dynamic-island/config.json`（0600） |
+| 待办、饮水、剪贴板、置物架 | `~/.local/state/ukui-dynamic-island/productivity.json`（0600） |
+| 日志 | `~/.local/state/ukui-dynamic-island/island.log` |
+| 开机自启 | `~/.config/autostart/ukui-dynamic-island.desktop`（仅勾选时创建） |
+| 已连接账号的令牌 | `~/.config/ukui-dynamic-island/*.json`（0600） |
 
 升级时直接安装新版本的 deb，程序目录会被覆盖，用户配置保留。回滚时安装上一个版本的 deb。配置解析失败会自动回退默认值，不会阻止启动。
 
 彻底清理用户数据：
 
 ```bash
-rm -rf ~/.config/ukui-island ~/.local/state/ukui-island
+rm -rf ~/.config/ukui-dynamic-island ~/.local/state/ukui-dynamic-island
 ```
 
-便携包安装到用户目录时，再删除 `~/.local/share/ukui-island`、`~/.local/bin/ukui-island` 和 `~/.local/share/applications/ukui-island.desktop`。
+便携包安装到用户目录时，再删除 `~/.local/share/ukui-dynamic-island`、`~/.local/bin/ukui-dynamic-island` 和 `~/.local/share/applications/ukui-dynamic-island.desktop`。
 
 ## 网络与隐私
 

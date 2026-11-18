@@ -545,7 +545,7 @@ def http_quota(url, timeout=6, token=""):
     if not url:
         return {"status": "unconfigured", "error": "未配置地址"}
     try:
-        headers = {"User-Agent": "ukui-island/0.6"}
+        headers = {"User-Agent": "ukui-dynamic-island/0.6"}
         if token:
             headers["Authorization"] = "Bearer " + token
         request = urllib.request.Request(url, headers=headers)
@@ -570,7 +570,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _http_json(url, token=None, extra=None, timeout=12, data=None,
                method=None):
     headers = {"Accept": "application/json",
-               "User-Agent": "ukui-island/0.6"}
+               "User-Agent": "ukui-dynamic-island/0.6"}
     if token:
         headers["Authorization"] = "Bearer " + token
     headers.update(extra or {})
@@ -1030,7 +1030,7 @@ def _workbuddy_login_request(raw):
 
 def workbuddy_login_start():
     raw = _http_json(
-        WORKBUDDY_ORIGIN + "/v2/plugin/auth/state?platform=ukui-island",
+        WORKBUDDY_ORIGIN + "/v2/plugin/auth/state?platform=ukui-dynamic-island",
         None, {"X-No-Authorization": "true", "X-No-User-Id": "true",
                "Content-Type": "application/json"}, data={})
     return _workbuddy_login_request(raw)
@@ -1117,7 +1117,7 @@ def _post_form(url, form, timeout=15):
     request = urllib.request.Request(url, data=data, headers={
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "ukui-island/0.6"})
+        "User-Agent": "ukui-dynamic-island/0.6"})
     opener = urllib.request.build_opener(_NoRedirect())
     with opener.open(request, timeout=timeout) as response:
         return json.loads(response.read(1_000_000).decode("utf-8", "replace"))
