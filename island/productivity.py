@@ -16,6 +16,18 @@ MAX_SHELF = 20
 WATER_GOAL = 2000
 WATER_STEP = 250
 WEEKDAY_TEXT = "一二三四五六日"
+MEETING_FIELDS = (("code", 32), ("place", 60), ("link", 300))
+
+
+def clean_meeting(value):
+    """Keep only the invite details a todo can show, each length-capped."""
+    raw = value if isinstance(value, dict) else {}
+    out = {}
+    for key, limit in MEETING_FIELDS:
+        text = str(raw.get(key) or "").strip()
+        if text:
+            out[key] = text[:limit]
+    return out
 
 
 def repeat_days(value):
@@ -43,6 +55,7 @@ def repeat_tag(days):
 class Productivity:
     def __init__(self, path=None):
         self.path = Path(path) if path else config.state_dir() / "productivity.json"
+        self.load_error = ""
         self.todos = []
         self.water_date = ""
         self.water_ml = 0
@@ -53,7 +66,12 @@ class Productivity:
     def _load(self):
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+            if not isinstance(raw, dict):
+                raise ValueError("root is not an object")
+        except FileNotFoundError:
+            raw = {}
+        except (OSError, ValueError, TypeError) as exc:
+            self.load_error = f"{self.path}: {type(exc).__name__}: {exc}"
             raw = {}
         for row in raw.get("todos", []):
             if isinstance(row, dict) and isinstance(row.get("text"), str):
@@ -65,6 +83,8 @@ class Productivity:
                         "repeat": repeat_days(row.get("repeat")),
                         "done_on": str(row.get("done_on") or ""),
                         "remind": str(row.get("remind") or ""),
+                        "remind_on": str(row.get("remind_on") or ""),
+                        "meeting": clean_meeting(row.get("meeting")),
                     })
         water = raw.get("water") or {}
         self.water_date = str(water.get("date") or "")
@@ -111,13 +131,15 @@ class Productivity:
             self.water_date = today
             self.water_ml = 0
 
-    def add_todo(self, text, repeat=None, remind=""):
+    def add_todo(self, text, repeat=None, remind="", remind_on="", meeting=None):
         text = str(text or "").strip()[:200]
         if not text:
             return False
         self.todos.insert(0, {"text": text, "done": False,
                               "repeat": repeat_days(repeat), "done_on": "",
-                              "remind": str(remind or "")})
+                              "remind": str(remind or ""),
+                              "remind_on": str(remind_on or ""),
+                              "meeting": clean_meeting(meeting)})
         self.todos = self.todos[:MAX_TODOS]
         self._save()
         return True
@@ -146,6 +168,9 @@ class Productivity:
 
     def todo_due(self, item, day=None):
         day = day or date.today()
+        remind_on = item.get("remind_on")
+        if remind_on and not item.get("repeat"):
+            return remind_on == day.isoformat()
         repeat = item.get("repeat") or []
         return not repeat or day.weekday() in repeat
 

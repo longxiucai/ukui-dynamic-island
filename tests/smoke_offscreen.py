@@ -17,12 +17,12 @@ os.environ["UKUI_ISLAND_CONFIG_DIR"] = tmp + "/config"
 os.environ["UKUI_ISLAND_STATE_DIR"] = tmp + "/state"
 
 from PySide2.QtCore import (QEvent, QMimeData, QObject, QPoint, QPointF,
-                            QUrl, Qt, Signal)  # noqa: E402
+                            QRect, QUrl, Qt, Signal)  # noqa: E402
 from PySide2.QtGui import (QDragEnterEvent, QDropEvent, QImage,
                            QMouseEvent, QPainter, QWheelEvent)  # noqa: E402
 from PySide2.QtWidgets import QApplication  # noqa: E402
 
-from island import config, sources, theme  # noqa: E402
+from island import config, render, sources, theme  # noqa: E402
 from island.window import LYRIC_FADE, PAGES, IslandWindow  # noqa: E402
 
 
@@ -76,6 +76,9 @@ def check_music_states() -> None:
             win.set_expanded(expanded, animate=False)
             pix = win.grab()
             assert not pix.isNull() and pix.width() > 0
+            if expanded and state is None:
+                assert any(action == "music_volume"
+                           for _, action, _ in win._hits)
             win.close()
             win.deleteLater()
 
@@ -104,6 +107,73 @@ def check_seek_drag() -> None:
     assert len(seen) == 1 and abs(seen[0] - 150) < 1
     win.close()
     win.deleteLater()
+
+
+def _battery_crop(win):
+    """The battery gauge body, cropped out of a grab."""
+    scale = win.base.scale
+    body_w = int((render.BATTERY_W - 3.2) * scale)
+    body_h = int(render.BATTERY_H * scale)
+    left = int(win.shape.rect.right() - win.base.inset
+               - render.BATTERY_W * scale - win._window_rect.left())
+    top = int(win.shape.rect.center().y() - body_h / 2 - win._window_rect.top())
+    return win.grab().toImage().copy(QRect(left, top, body_w, body_h))
+
+
+def _crop_pixels(image):
+    return (image.pixelColor(x, y) for x in range(image.width())
+            for y in range(image.height()))
+
+
+def check_battery_slot() -> None:
+    """The percent sits inside the gauge, so digit count cannot reflow the pill."""
+    widths = []
+    for level in (0.09, 0.68, 1.0):
+        win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+        win.set_data({"battery": level, "charging": False, "volume": 0.5,
+                      "cpu": 0.2, "memory": 0.3})
+        win.grab()
+        widths.append(win.shape.rect.width())
+        win.close()
+        win.deleteLater()
+    assert widths[0] == widths[1] == widths[2], widths
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_data({"battery": 0.68, "charging": False})
+    pixels = list(_crop_pixels(_battery_crop(win)))
+    assert any(c.red() > 200 and c.green() > 200 and c.blue() > 200
+               for c in pixels), "no digits inside the gauge"
+    win.set_data({"battery": 0.68, "charging": True})
+    pixels = list(_crop_pixels(_battery_crop(win)))
+    assert any(c.green() > c.red() + 40 and c.green() > c.blue() + 40
+               for c in pixels), "charging is not green"
+    win.set_data({"battery": 0.05, "charging": False})
+    pixels = list(_crop_pixels(_battery_crop(win)))
+    assert any(c.red() > c.green() + 40 and c.red() > c.blue() + 40
+               for c in pixels), "low battery is not red"
+    win.close()
+    win.deleteLater()
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_data({"battery": None})
+    win.grab()
+    assert not any(action == "battery" for _, action in win._compact_hits)
+    win.close()
+    win.deleteLater()
+
+    wide = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    wide.set_data({"battery": 0.68, "charging": False})
+    wide_width = wide.base.rect.width()
+    hidden = IslandWindow(dict(config.DEFAULTS, show_battery=False),
+                          theme.load("classic"))
+    hidden.set_data({"battery": 0.68, "charging": False})
+    hidden.grab()
+    assert hidden.base.rect.width() < wide_width
+    assert not any(action == "battery" for _, action in hidden._compact_hits)
+    wide.close()
+    wide.deleteLater()
+    hidden.close()
+    hidden.deleteLater()
 
 
 def check_lyrics_motion() -> None:
@@ -368,6 +438,344 @@ def check_reminders() -> None:
     win.deleteLater()
 
 
+def check_meeting_offer() -> None:
+    from datetime import datetime, timedelta
+
+    soon = datetime.now() + timedelta(days=2)
+    invite = (f"温建春 邀请您参加腾讯会议\n会议主题：交付评审\n"
+              f"会议时间：{soon:%Y/%m/%d} 09:20-09:50\n"
+              "#腾讯会议：902-631-704")
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    before = len(win.productivity.todos)
+    assert win.offer_meeting(invite)
+    assert win._notice and win._notice["kind"] == "meeting"
+    assert not win.offer_meeting(invite)
+    assert win.productivity.record_clip(invite)
+    assert win._content_width() <= win._compact_capacity(1.0) + 0.01
+    win.grab()
+
+    win._notice_until = time.monotonic() - 1
+    win._show_next_notice(force=True)
+    assert win._notice is None
+    kinds = [part[0] for part in win._compact_parts(1.0)]
+    assert "meeting" in kinds, kinds
+
+    win.set_page("todo")
+    win.set_expanded(True, animate=False)
+    win.grab()
+    assert any(action == "meeting_accept" for _, action, _ in win._hits)
+    open_today = win.productivity.progress()[1]
+    win._do_action("meeting_accept", None)
+    assert win._meeting_offer is None and win._notice is None
+    assert len(win.productivity.todos) == before + 1
+    assert win.productivity.todos[0]["text"].endswith("交付评审")
+    assert win.productivity.todos[0]["remind_on"] == soon.date().isoformat(), \
+        "非当天的会议要带日期，别混进今日待办"
+    assert win.productivity.progress()[1] == open_today, "后天的会议不计今日"
+    win.grab()
+    # 非当天的 dated 待办不能因为“今天不该做”就勾不掉
+    solo = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    solo.productivity.add_todo("11/22 09:20 后天的评审", None, "09:20",
+                               soon.date().isoformat())
+    solo.set_page("todo")
+    solo.set_expanded(True, animate=False)
+    solo.grab()
+    assert any(action == "todo_toggle" and arg == 0
+               for _, action, arg in solo._hits), solo._hits
+
+    # 当天会议会响铃一次、非当天不计今日：这两条在 test_core 里用固定日期断言
+
+    win.offer_meeting(f"会议主题：备份沟通\n"
+                      f"会议时间：{soon:%Y/%m/%d} 17:00-17:45\n"
+                      "#腾讯会议：370-268-672")
+    win._do_action("meeting_reject", None)
+    assert win._meeting_offer is None and len(win.productivity.todos) == before + 1
+    assert win.offer_meeting(invite), "重新复制同一条要再问一次"
+    win._do_action("meeting_reject", None)
+
+    win.offer_meeting(f"会议主题：过期不再问\n会议时间：{soon:%Y/%m/%d} 10:00")
+    win._meeting_offer["until"] = time.monotonic() - 1
+    win._tick()
+    assert win._meeting_offer is None
+    assert "meeting" not in [part[0] for part in win._compact_parts(1.0)]
+
+    off = IslandWindow(dict(config.DEFAULTS, meeting_detect=False),
+                       theme.load("classic"))
+    assert not off.offer_meeting(invite)
+    assert off._notice is None and off._meeting_offer is None
+
+
+def check_stock_session_chip() -> None:
+    quote = {"status": "ok", "code": "sh000001", "name": "上证指数",
+             "price": 3577.62, "prev_close": 3587.83, "change": -10.21,
+             "change_pct": -0.28, "high": 3584.28, "low": 3547.94,
+             "date": "20261119", "at": "16:14", "points": []}
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_data({"battery": 0.8, "cpu": 0.2, "memory": 0.3})
+    win.set_stock(dict(quote))
+
+    win._stock_chip_visible = lambda: True
+    win._stock_shown = True
+    assert "stock" in [part[0] for part in win._compact_parts(1.0)]
+    wide = win._content_width()
+
+    win._stock_chip_visible = lambda: False
+    win._tick()
+    assert not win._stock_shown
+    assert "stock" not in [part[0] for part in win._compact_parts(1.0)]
+    assert win._content_width() < wide
+
+    win._tick()
+    assert win._content_width() < wide
+
+    win._stock_chip_visible = lambda: True
+    win._tick()
+    assert win._stock_shown and win._content_width() == wide
+
+    real = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    real.set_stock(dict(quote, date="20261116"))
+    assert not real._stock_chip_visible(), "收盘宽限后应隐藏"
+    real.set_stock(dict(quote, date="20261113"))
+    assert not real._stock_chip_visible(), "行情日期不是今天应隐藏"
+    off = IslandWindow(dict(config.DEFAULTS, stock_hide_closed=False),
+                       theme.load("classic"))
+    off.set_stock(dict(quote, date="20261113"))
+    assert off._stock_chip_visible(), "关掉开关后不隐藏"
+
+    hidden = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    hidden.set_stock(dict(quote))
+    hidden._stock_shown = False
+    hidden.set_page("stock")
+    hidden.set_expanded(True, animate=False)
+    hidden.grab()
+    assert any("休市" in text for text in _painted_text(hidden))
+
+
+def _painted_text(win):
+    import island.window as window_module
+
+    seen = []
+    original = window_module.render.paint_text
+
+    def spy(painter, rect, text, *args, **kwargs):
+        seen.append(str(text))
+        return original(painter, rect, text, *args, **kwargs)
+
+    window_module.render.paint_text = spy
+    try:
+        win.grab()
+    finally:
+        window_module.render.paint_text = original
+    return seen
+
+
+
+
+def check_todo_dot_needs_confirm() -> None:
+    """询问未确认时，待办页码豆上要亮提醒点（和喝水待确认一致）。"""
+    from datetime import datetime, timedelta
+
+    soon = datetime.now() + timedelta(days=2)
+    invite = (f"会议主题：交付评审\n会议时间：{soon:%Y/%m/%d} 09:20-09:50")
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    accent = win.theme.color("accent").name()
+
+    def todo_dot():
+        # 停在别的页取样，否则待办自己的当前页豆豆本来就是强调色
+        win.set_page("music")
+        win.set_expanded(True, animate=False)
+        image = win.grab().toImage()
+        ox, oy = win._window_origin()
+        rect = next(rect for rect, action, arg in win._hits
+                    if action == "page" and arg == "todo")
+        return image.pixelColor(int(rect.center().x()) - ox,
+                                int(rect.center().y() - 7) - oy).name()
+
+    assert todo_dot() != accent, "没有待确认时不该亮"
+    assert win.offer_meeting(invite)
+    assert todo_dot() == accent, "询问中要点亮待办豆豆"
+    win._resolve_meeting(False)
+    assert todo_dot() != accent, "确认后该熄灭"
+
+    win.offer_meeting(invite)
+    assert todo_dot() == accent
+    win._meeting_offer["until"] = time.monotonic() - 1
+    win._tick()
+    assert todo_dot() != accent, "超时后也该熄灭"
+
+    off = IslandWindow(dict(config.DEFAULTS, meeting_detect=False),
+                       theme.load("classic"))
+    assert not off.offer_meeting(invite)
+    assert off._meeting_offer is None
+
+
+def check_todo_meeting_detail() -> None:
+    from datetime import datetime, timedelta
+
+    soon = datetime.now() + timedelta(days=2)
+    invite = ("温建春 邀请您参加腾讯会议\n会议主题：交付评审\n"
+              f"会议时间：{soon:%Y/%m/%d} 09:20-09:50\n"
+              "https://meeting.tencent.com/dm/abc123\n"
+              "#腾讯会议：902-631-704\n会议地点：3 楼 302 会议室")
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_data({"battery": 0.8, "cpu": 0.2, "memory": 0.3})
+    win.productivity.add_todo("买牛奶")
+    win.offer_meeting(invite)
+    win.set_page("todo")
+    win.set_expanded(True, animate=False)
+    win._do_action("meeting_accept", None)
+    index = 0
+    assert win.productivity.todos[index]["meeting"]["place"] == "3 楼 302 会议室"
+
+    win.grab()
+    hits = [(action, arg) for _, action, arg in win._hits]
+    assert ("todo_detail", index) in hits, hits
+    assert ("todo_toggle", index) in hits, hits
+    assert ("todo_detail", 1) not in hits, "普通待办不该有详情入口"
+
+    win._do_action("todo_detail", index)
+    win.grab()
+    assert any(action == "copy" and arg == "902631704"
+               for _, action, arg in win._hits)
+    assert any(action == "copy" and arg.endswith("abc123")
+               for _, action, arg in win._hits)
+    assert any(action == "todo_toggle" and arg == index for _, action, arg
+               in win._hits), "详情页要能直接勾完成"
+    win._do_action("copy", "902631704")
+    assert QApplication.clipboard().text() == "902631704"
+    win._do_action("todo_toggle", index)
+    assert win.productivity.todos[index]["done"]
+    win._do_action("todo_toggle", index)
+
+    win._do_action("todo_back", None)
+    assert win._todo_detail is None
+    win._do_action("todo_detail", index)
+    win._do_action("todo_remove", index)
+    assert win._todo_detail is None, "删掉后不能继续显示详情"
+    win.grab()
+
+    # 到点横幅点开就是详情
+    now = datetime.now()
+    win.offer_meeting(f"会议主题：今天的对齐\n会议时间：{now:%Y/%m/%d} 09:00")
+    win._do_action("meeting_accept", None)
+    item = win.productivity.todos[0]
+    item["remind"] = now.strftime("%H:%M")
+    item["remind_on"] = now.date().isoformat()
+    win._notice = None
+    win._alerts = []
+    win._todo_remind_day = (now - timedelta(days=1)).date().isoformat()
+    win._todo_reminder_tick()
+    assert win._notice and win._notice["kind"] == "todo"
+    win._open_notice()
+    assert win._todo_detail == 0, "点横幅要直接看到会议号"
+    assert not win._alerts, "横幅不应重复排队"
+
+
+def check_tools_default_subpage() -> None:
+    """空置物架不值得占默认位，进 tools 先看剪贴。"""
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_expanded(True, animate=False)
+    win.productivity.clear_shelf()
+    win.productivity.clips = []
+    win.productivity.record_clip("剪贴优先")
+    assert not win.productivity.shelf
+    win.set_page("music")
+    win.set_page("tools")
+    assert win.tools_page == "clips", win.tools_page
+    assert not win.grab().isNull()
+
+    # 显式点置物标签仍然去置物，空状态要能拖文件进去
+    win.set_tools_page("shelf")
+    assert win.tools_page == "shelf"
+    win.grab()
+    assert any(action == "shelf_add" for _, action, _ in win._hits)
+
+    win.productivity.add_shelf("/etc/hosts")
+    win.set_tools_page("shelf")
+    win.set_page("music")
+    win.set_page("tools")
+    assert win.tools_page == "shelf", "有置物就该优先显示置物"
+
+    # 拖文件进来是明确意图，不能被改写
+    win.set_page("music")
+    win.productivity.clear_shelf()
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile("/etc/hostname")])
+    win.dragEnterEvent(QDragEnterEvent(
+        QPoint(10, 10), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier))
+    assert win.tools_page == "shelf", win.tools_page
+
+    # 两边都空时留在置物架，那里有拖拽提示可看
+    win.productivity.clips = []
+    win.set_page("music")
+    win.set_page("tools")
+    assert win.tools_page == "shelf", win.tools_page
+    win.close()
+
+
+def check_tools_notify_dot() -> None:
+    """页码豆亮起来就该能看出是通知，而不是挨个标签翻。"""
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_expanded(True, animate=False)
+    win.productivity.record_clip("一条剪贴")
+    danger = win.theme.color("danger").name()
+
+    def paint():
+        win._page_at = time.monotonic() - 1  # 翻页位移结束后再取样
+        return win.grab().toImage()
+
+    def sample(image, rect, dx=0.0, dy=0.0):
+        ox, oy = win._window_origin()
+        return image.pixelColor(int(rect.center().x() + dx) - ox,
+                                int(rect.center().y() + dy) - oy).name()
+
+    def page_dot():
+        win.set_page("music")
+        win.set_expanded(True, animate=False)
+        image = paint()
+        rect = next(rect for rect, action, arg in win._hits
+                    if action == "page" and arg == "tools")
+        return sample(image, rect, dy=-7)
+
+    def notify_tab_dot():
+        image = paint()
+        rect = next(rect for rect, action, arg in win._tools_hits
+                    if action == "tools" and arg == "notify")
+        return sample(image, rect, dx=rect.width() / 2 - 6)
+
+    assert page_dot() != danger, "没通知时页码豆不该亮红点"
+    win.set_page("tools")
+    win.set_tools_page("shelf")
+    assert notify_tab_dot() != danger
+    assert page_dot() != danger
+
+    win.set_page("music")
+    win.add_notification({"app": "系统", "summary": "更新完成",
+                          "body": "", "at": "10:00"})
+    assert win._unread == 1
+    assert page_dot() == danger, "新通知要点亮 tools 页码豆"
+
+    win.set_page("tools")
+    assert win.tools_page == "notify", "亮着就该直接落到通知"
+    assert win._unread == 0, "看过通知后豆豆要熄灭"
+    assert notify_tab_dot() != danger
+    assert page_dot() != danger
+
+    # 停在置物架时来通知，当前页上就要立刻看出是哪个标签
+    win.set_page("tools")
+    win.set_tools_page("shelf")
+    win.add_notification({"app": "系统", "summary": "另一条",
+                          "body": "", "at": "10:01"})
+    assert win.tools_page == "shelf", "不该把用户从当前标签拽走"
+    assert notify_tab_dot() == danger, "通知标签上要有点"
+    win.set_tools_page("notify")
+    assert win._unread == 0
+    assert notify_tab_dot() != danger
+    win.close()
+    win.deleteLater()
+
+
 def check_notice_pet_clip() -> None:
     import island.window as window_module
 
@@ -429,6 +837,73 @@ def check_refresh_feedback() -> None:
     assert calls == ["calendar"] and win._refreshing("calendar")
     win.set_calendar({"status": "ok", "items": []})
     assert not win._refreshing("calendar")
+    win.close()
+    win.deleteLater()
+
+
+def check_mail_flag_feedback() -> None:
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.cfg["mail_sync_operations"] = True
+    sent = []
+    win.mail_action.connect(lambda action, uid: sent.append((action, uid)))
+    item = {"sender": "a@x.com", "subject": "登录邮件", "date": "10:00",
+            "uid": "7", "seen": True, "code": "", "body": "hi"}
+    win.set_mail({"status": "ok", "error": "", "unread": 0,
+                  "items": [dict(item)]})
+    win.set_page("mail")
+    win.set_expanded(True, animate=False)
+    win._do_action("mail_open", 0)
+    assert not win._mail_unread(win.mail["items"][0])
+    win._do_action("mail_unread")
+    assert sent == [("unseen", "7")], sent
+    # 点完立刻按未读显示，不等服务器回包
+    assert win._mail_unread(win.mail["items"][0])
+    # 服务器拒绝：回到真实状态，人留在详情页好重试
+    win.set_mail_operation({"status": "error",
+                            "error": "服务器未接受已读状态修改"})
+    assert not win._mail_unread(win.mail["items"][0])
+    assert win._mail_detail == 0
+    # 服务器接受：状态落到缓存，刷新回来前不闪回
+    win._do_action("mail_unread")
+    win.set_mail_operation({"status": "ok", "message": "已同步未读状态"})
+    assert win._mail_unread(win.mail["items"][0])
+    assert win.mail["items"][0]["seen"] is False
+    # 验证码卡片优先：状态要么完整、要么短词，不能截成“已同…”
+    import island.window as window_module
+
+    texts = []
+    original_paint_text = window_module.render.paint_text
+
+    def spy(painter, rect, text, *args, **kwargs):
+        texts.append(str(text))
+        return original_paint_text(painter, rect, text, *args, **kwargs)
+
+    card = {"sender": "Microsoft", "subject": "安全代码", "date": "17:37",
+            "uid": "9", "seen": False, "code": "262432", "body": "hi"}
+    win._mail_detail = None
+    win.set_mail({"status": "ok", "error": "", "unread": 2,
+                  "items": [card, dict(item)]})
+    window_module.render.paint_text = spy
+    try:
+        win.grab()
+    finally:
+        window_module.render.paint_text = original_paint_text
+    assert "262432" in texts, texts
+    assert "已同步" in texts, texts
+    assert "全部 2" in texts and "未读 1" in texts, texts
+    assert not any("已同…" in t for t in texts), texts
+    # 报错时借整行显示完整原因，卡片仍然在
+    win._mail_op_message = "服务器未接受已读状态修改"
+    win._mail_op_token = "danger"
+    win._mail_op_until = time.monotonic() + 60
+    texts.clear()
+    window_module.render.paint_text = spy
+    try:
+        win.grab()
+    finally:
+        window_module.render.paint_text = original_paint_text
+    assert "服务器未接受已读状态修改" in texts, texts
+    assert "262432" in texts, texts
     win.close()
     win.deleteLater()
 
@@ -586,7 +1061,14 @@ def check_pages() -> None:
                   "memory": 0.37, "cpu": 0.83, "disk": 0.62, "temperature": 54,
                   "gpu": None, "net_down": 1_240_000, "net_up": 320_000,
                   "online": True,
-                  "weather": {"temp": 13, "text": "小雨", "place": "长沙"}})
+                  "weather": {"temp": 13, "text": "小雨", "place": "长沙",
+                              "region": "湖南", "feels": 11, "humidity": 78,
+                              "wind": 9, "high": 16, "low": 9,
+                              "daily": [
+                                  {"date": f"2026-11-{19 + i:02d}",
+                                   "text": "小雨", "kind": "rain",
+                                   "high": 16 - i, "low": 8 + i,
+                                   "precip": 10 * i} for i in range(7)]}})
     win.set_music({"title": "晴天", "artist": "周杰伦", "status": "Playing",
                    "position": 42, "length": 215, "can_seek": True,
                    "player": "org.mpris.MediaPlayer2.spotify",
@@ -624,6 +1106,13 @@ def check_pages() -> None:
         {"id": "remote", "label": "远程", "plan": "通用 JSON",
          "status": "unconfigured", "error": "", "updated": 0,
          "metrics": [], "usage": None, "note": "未配置"}]})
+    win.set_stock({"status": "ok", "code": "sh000001", "name": "上证指数",
+                   "price": 3587.83, "prev_close": 3584.58, "change": 3.25,
+                   "change_pct": 0.09, "high": 3596.55, "low": 3560.45,
+                   "at": "16:15",
+                   "points": [["0930", 3596.55], ["1000", 3580.12],
+                              ["1130", 3560.45], ["1400", 3590.20],
+                              ["1500", 3587.83]]})
     win.add_notification({"app": "微信", "summary": "在吗", "body": "",
                           "at": "12:28"})
     win.set_expanded(True, animate=False)
@@ -640,12 +1129,9 @@ def check_pages() -> None:
     assert all(abs(rect.width() - 10) < 0.01 for rect in pager)
     win.cfg["show_monitor"] = False
     win.apply(win.cfg, win.theme)
-    assert win.page == "music"
-    win.set_page("monitor")
-    assert win.page == "music"
     win.grab()
     pager = [rect for rect, action, _ in win._hits if action == "page"]
-    assert len(pager) == len(PAGES) - 1
+    assert len(pager) == len(PAGES), "monitor page stays when the slot is off"
     win.cfg["show_monitor"] = True
     win.apply(win.cfg, win.theme)
     win.set_page("quota")
@@ -655,6 +1141,25 @@ def check_pages() -> None:
     win._do_action("quota_pick", "claude")
     assert win.quota_selected == "claude"
     win._do_action("quota_pick", "codex")
+    win.set_page("stock")
+    assert not win.grab().isNull()
+    assert any(action == "stock_refresh" for _, action, _ in win._hits)
+    called = []
+    win.stock_refresh = lambda: called.append(True)
+    win._do_action("stock_refresh")
+    assert called
+    win.set_stock({"status": "error", "code": "sh000001",
+                   "error": "网络中断", "points": []})
+    assert not win.grab().isNull()
+    win.set_stock({"status": "ok", "code": "sh000001", "name": "上证指数",
+                   "price": 3587.83, "prev_close": 3584.58, "change": 3.25,
+                   "change_pct": 0.09, "high": 3596.55, "low": 3560.45,
+                   "at": "16:15",
+                   "points": [["0930", 3596.55], ["1000", 3580.12],
+                              ["1500", 3587.83]]})
+    # 收起态涨跌格只在交易时段显示，这里关掉开关，让后面的槽位断言与时间无关
+    win.cfg["stock_hide_closed"] = False
+    win.apply(win.cfg, win.theme)
     win.set_activity({"provider": "Codex", "state": "responding",
                       "label": "正在回答", "detail": "正在修改窗口渲染",
                       "active": True, "at": time.time()})
@@ -663,11 +1168,26 @@ def check_pages() -> None:
     win.set_expanded(False, animate=False)
     win.grab()
     assert any(page == "quota" for _, page in win._compact_hits)
+    assert any(page == "stock" for _, page in win._compact_hits)
+    assert any(kind == "stock" for kind, _, _ in win._compact_parts(1.0))
     win.set_activity({"provider": "Codex", "state": "completed",
                       "label": "任务完成", "detail": "已修改窗口渲染",
                       "active": False, "at": time.time()})
     assert win._activity_visible()
     assert not win.grab().isNull()
+    assert any(kind == "activity" for kind, _, _ in win._compact_parts(1.0))
+    win.cfg["show_activity"] = False      # feature off: pill slot and quota line
+    win.grab()
+    assert not win._activity_visible()
+    assert not any(kind == "activity" for kind, _, _ in win._compact_parts(1.0))
+    win.set_expanded(True, animate=False)
+    win.set_page("quota")
+    assert not win.grab().isNull()
+    win.set_expanded(False, animate=False)
+    win.cfg["show_activity"] = True
+    win.clear_activity()
+    assert not win._activity_visible()
+    assert win.activity.get("state") == "idle"
     win.set_activity({"provider": "Codex", "state": "completed",
                       "label": "任务完成", "detail": "旧任务",
                       "active": False, "at": time.time() - 3600})
@@ -713,11 +1233,20 @@ def check_pages() -> None:
 
     win.set_page("music")
     win._do_action("nav", 1)
-    assert win.page == "focus"
+    assert win.page == "weather"
     win._do_action("nav", -1)
     assert win.page == "music"
 
     win.set_page("todo")
+    area = win._content_rect()
+    card = win._todo_card_rect()
+    win.grab()
+    add = next(rect for rect, action, _ in win._hits if action == "todo_add")
+    edit = next(rect for rect, action, _ in win._hits if action == "todo_edit")
+    assert edit.left() == add.left() and edit.top() > add.bottom(), \
+        "添加和改一下要上下排列"
+    assert edit.bottom() <= area.bottom(), "下移后不能超出内容区"
+    assert card.width() > area.width() * 0.7, "按钮腾出的宽度要给列表"
     win._do_action("todo_add")
     win.todo_input.setText("写周报")
     win._todo_submit()
@@ -801,7 +1330,10 @@ def check_scroll_areas() -> None:
 
 
 def check_settings_dialog() -> None:
-    from island.settings_window import SettingsDialog
+    from PySide2.QtGui import QColor
+
+    from island.settings_window import (SettingsDialog, _blend, _body_color,
+                                        _ink_on, _preview_stage)
 
     class FakeApp:
         def __init__(self):
@@ -818,8 +1350,23 @@ def check_settings_dialog() -> None:
         def set_option(self, key, value):
             self.cfg[key] = value
 
-        def set_weather_city(self, value):
-            pass
+        def set_weather_city(self, value, lat=None, lon=None):
+            self.cfg.update({"weather_city": value, "weather_auto": False,
+                             "weather_lat": lat, "weather_lon": lon})
+
+        def set_weather_auto(self):
+            self.cfg["weather_auto"] = True
+
+        def set_stock_code(self, value):
+            self.cfg["stock_code"] = value
+
+        @property
+        def active_theme(self):
+            current = self.themes[self.cfg["theme"]]
+            alpha = self.cfg.get("glass_alpha")
+            if alpha is None or current.material.get("kind") != "glass":
+                return current
+            return current.with_alpha(alpha / 100.0)
 
         def set_autostart(self, value):
             pass
@@ -829,12 +1376,80 @@ def check_settings_dialog() -> None:
 
     dialog = SettingsDialog(FakeApp())
     assert dialog.windowType() == Qt.Window
+    # 预览底色必须和岛本身分得开，否则浅色皮肤下岛框融进背景
+    for theme_id in dialog.app.theme_ids:
+        th = dialog.app.themes[theme_id]
+        for alpha in (None, 35, 100):
+            shown = th if alpha is None else th.with_alpha(alpha / 100.0)
+            stage = QColor(_preview_stage(shown))
+            body = _blend(stage, _body_color(shown))
+            assert theme.contrast(stage, body) >= 1.45, (theme_id, alpha)
     dialog.select_tab("mail")
-    assert dialog.tabs.currentIndex() == 2
+    assert dialog.tabs.currentIndex() == 3
     dialog.select_tab("unknown")
     assert dialog.tabs.currentIndex() == 0
     dialog.show()
     assert not dialog.grab().isNull()
+    # QSS 丢弃非整数 px，字号阶梯只能用整数；这里锁住实际渲染值。
+    from PySide2.QtWidgets import QLabel
+    steps = {name: {label.font().pixelSize()
+                    for label in dialog.findChildren(QLabel)
+                    if label.objectName() == name}
+             for name in ("section", "hint")}
+    assert steps == {"section": {11}, "hint": {11}}, steps
+    # 开关改动要等后台线程回信号才反映到岛上，只抓一帧预览会停在旧样子
+    dialog.weather_on.setChecked(False)
+    assert "weather" not in [part[0]
+                             for part in dialog._sample._compact_parts(1.0)]
+    dialog.stock_on.setChecked(False)
+    assert "stock" not in [part[0]
+                           for part in dialog._sample._compact_parts(1.0)]
+    dialog.stock_on.setChecked(True)
+    dialog.weather_on.setChecked(True)
+    assert "weather" in [part[0]
+                         for part in dialog._sample._compact_parts(1.0)]
+    assert not dialog.preview.pixmap().isNull()
+    # 鼠标穿透开启后岛点不动，警告必须可见；关闭时不留常驻说明
+    dialog.click_through.setChecked(True)
+    assert "托盘" in dialog.click_through_warn.text()
+    dialog.click_through.setChecked(False)
+    assert not dialog.click_through_warn.text()
+    # 主按钮文字压在强调色上要够读（12px 粗体按 WCAG 要 4.5:1）
+    for theme_id in dialog.app.theme_ids:
+        th = dialog.app.themes[theme_id]
+        ink = _ink_on(th.color("accent"), th.color("onAccent"))
+        assert theme.contrast(ink, th.color("accent")) >= 4.5, theme_id
+    # 标签列定宽，否则切 tab 时整列会左右跳（卡片内另有内边距，不计入）
+    from PySide2.QtWidgets import QFormLayout
+
+    from island.settings_window import Form
+    labels = []
+    for index in range(dialog.tabs.count()):
+        for form in dialog.tabs.widget(index).findChildren(Form):
+            item = form.itemAt(0, QFormLayout.LabelRole)
+            if item is not None and item.widget() is not None:
+                labels.append(item.widget())
+    assert labels, "每一页都该有表单"
+    assert all(label.minimumWidth() == Form.LABEL_W for label in labels)
+    dialog._weather_result(
+        {"place": "北京", "temp": 12.4, "text": "多云"})
+    assert dialog.weather_temp.text() == "12°"
+    assert dialog.weather_state.text() == "已更新"
+    dialog._weather_result(
+        {"place": "北京", "temp": 12.4, "text": "多云",
+         "stale": True, "error": "网络中断"})
+    assert dialog.weather_state.text() == "离线 · 上次数据"
+    assert "网络中断" in dialog.weather_note.text()
+    dialog.city_search.setText("长沙")
+    dialog._city_found("长沙", [{"name": "长沙", "region": "湖南",
+                                 "lat": 28.2282, "lon": 112.9388}])
+    assert dialog.city_results.count() == 1
+    assert dialog.city_add.isEnabled()
+    assert not dialog.city_result_row.isHidden()
+    dialog._add_picked_city()
+    assert dialog.city_result_row.isHidden()
+    assert dialog.app.cfg["weather_saved"][-1]["name"] == "长沙"
+    assert dialog.app.cfg["weather_lat"] == 28.2282
     assert dialog.material_box.isHidden()
     dialog.theme.setCurrentIndex(dialog.theme.findData("glass-dark"))
     assert not dialog.material_box.isHidden()
@@ -847,6 +1462,91 @@ def check_settings_dialog() -> None:
                  (image.width() - 2, image.height() - 2)):
         assert image.pixelColor(x, y).lightness() < 120, (x, y)
     dialog.theme.hidePopup()
+    dialog.stock_code.setText("600519")
+    dialog._save_stock_code()
+    assert dialog.stock_code.text() == "sh600519"
+    assert dialog.stock_status.text() == "已保存 sh600519"
+    assert dialog.stock_hide_closed.isChecked()
+    assert dialog.stock_grace_minutes.value() == 15
+    assert dialog.stock_grace_minutes.isEnabled()
+    dialog.stock_grace_minutes.setValue(30)
+    assert dialog.app.cfg["stock_grace_minutes"] == 30
+    dialog.stock_hide_closed.setChecked(False)
+    assert not dialog.stock_grace_minutes.isEnabled()
+    assert dialog.app.cfg["stock_hide_closed"] is False
+
+    # 玻璃透明度：跟随皮肤默认 / 改成自己的值 / 恢复默认
+    dialog.theme.setCurrentIndex(dialog.theme.findData("glass-light"))
+    assert dialog.material_box.isVisible()
+    assert dialog.glass_alpha.value() == 62
+    assert dialog.glass_alpha_value.text() == "62%"
+    assert not dialog.glass_reset.isEnabled()
+    dialog.glass_alpha.setValue(30)
+    assert dialog.glass_alpha_value.text() == "30%"
+    assert dialog.app.cfg["glass_alpha"] is None, "拖动中不该每像素写一次配置"
+    dialog.glass_alpha.sliderReleased.emit()
+    assert dialog.app.cfg["glass_alpha"] == 30
+    assert dialog.app.active_theme.material["alpha"] == 0.30
+    assert dialog.glass_reset.isEnabled()
+    # 键盘/点击改值没有 sliderReleased，靠防抖定时器落盘
+    dialog.glass_alpha.setValue(75)
+    deadline = time.monotonic() + 1.0
+    while (time.monotonic() < deadline
+           and dialog.app.cfg["glass_alpha"] != 75):
+        QApplication.processEvents()
+        time.sleep(0.02)
+    assert dialog.app.cfg["glass_alpha"] == 75, "防抖后必须落盘"
+    dialog.glass_reset.click()
+    assert dialog.app.cfg["glass_alpha"] is None
+    assert dialog.glass_alpha.value() == 62
+    assert dialog.app.active_theme.material["alpha"] == 0.62
+    assert not dialog.glass_reset.isEnabled()
+    dialog.theme.setCurrentIndex(dialog.theme.findData("classic"))
+    assert not dialog.material_box.isVisible()
+    dialog.theme.setCurrentIndex(dialog.theme.findData("glass-dark"))
+    assert dialog.glass_alpha.value() == 58, "换皮肤要跟着该皮肤的默认值"
+    dialog.theme.setCurrentIndex(dialog.theme.findData("glass-light"))
+    dialog.glass_alpha.setValue(45)
+    dialog.glass_alpha.sliderReleased.emit()
+    dialog.theme.setCurrentIndex(dialog.theme.findData("classic"))
+    dialog.theme.setCurrentIndex(dialog.theme.findData("glass-light"))
+    assert dialog.glass_alpha.value() == 45, "共享设置要保留"
+
+    def scroll(widget, dy=-120):
+        point = QPointF(10, 10)
+        global_point = QPointF(widget.mapTo(None, point.toPoint()))
+        event = QWheelEvent(point, global_point, QPoint(), QPoint(0, dy),
+                            Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase,
+                            False)
+        widget.wheelEvent(event)
+        return event
+
+    # 滚轮掠过数字框/下拉框：只翻页，不改值
+    value_before = dialog.stock_grace_minutes.value()
+    index_before = dialog.theme.currentIndex()
+    dialog.resize(560, 300)
+    page = dialog.tabs.widget(0)
+    bar = page.verticalScrollBar()
+    bar.setValue(0)
+    assert bar.maximum() > 120, bar.maximum()
+    event = scroll(dialog.stock_grace_minutes)
+    assert event.isAccepted() and bar.value() > 0
+    assert dialog.stock_grace_minutes.value() == value_before
+    bar.setValue(0)
+    assert scroll(dialog.theme).isAccepted() and bar.value() > 0
+    assert dialog.theme.currentIndex() == index_before
+    alpha_before = dialog.glass_alpha.value()
+    bar.setValue(0)
+    assert scroll(dialog.glass_alpha).isAccepted() and bar.value() > 0
+    assert dialog.glass_alpha.value() == alpha_before, "滚轮掠过滑块不能改值"
+    assert dialog.app.cfg["glass_alpha"] == alpha_before, "滑块滚轮不能写配置"
+
+    # 误删行情代码后直接关框：不保存半成品，重新打开显示已保存的代码
+    dialog.stock_code.setText("")
+    dialog.close()
+    dialog.show()
+    assert dialog.stock_code.text() == "sh600519"
+    assert dialog.app.cfg["stock_code"] == "sh600519"
     dialog._mail_result({"status": "ok", "at": "12:30", "unread": 3})
     assert dialog.mail_status.text() == "已连接 12:30 · 3 封未读"
     assert not dialog.mail_status.isHidden()
@@ -874,15 +1574,38 @@ def check_monitor_off() -> None:
     win.data.update(cpu=0.5, memory=0.6, disk=0.7, temperature=60,
                     gpu={"util": 0.3}, net_down=1.0, net_up=2.0,
                     online=True)
+    win.set_expanded(True, animate=False)
     win.set_page("monitor")
     win.cfg["show_monitor"] = False
+    seen = []
+    win.monitor_focus.connect(seen.append)
     win.apply(win.cfg, win.theme)
-    assert win.page == "music"
+    assert win.page == "monitor", "the page stays reachable"
+    assert win.expanded and seen[-1] is True, "open page keeps sampling"
     assert all(kind not in ("cpu", "mem")
                for kind, _, _ in win._compact_parts(1.0))
-    assert all(win.data[key] is None for key in (
-        "cpu", "memory", "disk", "temperature", "gpu", "net_down",
-        "net_up", "online"))
+    assert win.data["cpu"] == 0.5, "readings are not wiped"
+    win.set_expanded(False, animate=False)
+    assert seen[-1] is False, "collapsed pill without slots stops sampling"
+    win.set_expanded(True, animate=False)
+    win.set_page("music")
+    assert seen[-1] is True, "the idle music page shows the status cells"
+    win.set_music({"title": "晴天", "artist": "周杰伦", "status": "Playing",
+                   "position": 42, "length": 215, "player": "x"})
+    assert seen[-1] is False, "a playing track has no status cells"
+    win.set_music(None)
+    assert seen[-1] is True, "the idle music page shows the status cells"
+    win.set_music({"title": "晴天", "artist": "周杰伦", "status": "Playing",
+                   "position": 42, "length": 215, "player": "x"})
+    win.set_page("todo")
+    win.set_page("music")
+    assert seen[-1] is False, "still no strip while playing"
+    win.set_music(None)
+    win.set_page("music")
+    assert seen[-1] is True
+    win.cfg["show_monitor"] = True
+    win.apply(win.cfg, win.theme)
+    assert seen[-1] is True, "the collapsed slots need the readings back"
     win.close()
     win.deleteLater()
 
@@ -931,6 +1654,69 @@ def check_line_status() -> None:
     win.deleteLater()
 
 
+def check_button_ink_centered() -> None:
+    """Button labels centre on their ink, not on the font line box."""
+    from PySide2.QtCore import QRectF
+    from PySide2.QtGui import QFont, QImage, QPainter
+
+    t = theme.load("classic")
+    ink = t.color("textSecondary")
+    k = 10  # 10x size, so drift is readable at 0.1px of real size
+    for text in ("刷新", "全部已读", "专注"):
+        rect = QRectF(50, 100, 40 * k, 19 * k)
+        image = QImage(600, 400, QImage.Format_ARGB32)
+        image.fill(t.color("surface"))
+        painter = QPainter(image)
+        render.paint_button(painter, rect, text, t, px=9 * k)
+        painter.end()
+        rows = [y for y in range(400)
+                if sum(abs(image.pixelColor(x, y).red() - ink.red()) +
+                       abs(image.pixelColor(x, y).green() - ink.green()) +
+                       abs(image.pixelColor(x, y).blue() - ink.blue()) < 30
+                       for x in range(int(rect.left()), int(rect.right()))) > 3]
+        drift = abs((min(rows) + max(rows)) / 2 - rect.center().y()) / k
+        assert drift <= 0.15, (text, drift)
+
+
+def check_mail_status_centered() -> None:
+    """The short 同步中/已同步 status sits between the filters and 刷新."""
+    import island.window as window_module
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_expanded(True, animate=False)
+    win.set_page("mail")
+    win.set_mail({"status": "ok", "error": "", "unread": 3, "items": [
+        {"uid": "1", "sender": "a@x.com", "subject": "验证码 262432",
+         "date": "10:00", "code": "262432", "seen": False},
+        {"uid": "2", "sender": "b@x.com", "subject": "登录邮件",
+         "date": "10:00", "code": "", "seen": False}]})
+    win._mail_op_message = "正在同步已读…"
+    win._mail_op_until = time.monotonic() + 15
+    win._mail_op_token = "textTertiary"
+    seen = []
+    original = window_module.render.paint_text
+
+    def spy(painter, rect, text, *args, **kwargs):
+        seen.append((str(text), rect))
+        return original(painter, rect, text, *args, **kwargs)
+
+    window_module.render.paint_text = spy
+    try:
+        win.grab()
+    finally:
+        window_module.render.paint_text = original
+    status = [rect for text, rect in seen if text == "同步中"]
+    assert len(status) == 1, seen
+    tabs = [rect for rect, action, _ in win._hits if action == "mail_filter"]
+    refresh = [rect for rect, action, _ in win._hits
+               if action == "mail_refresh"][0]
+    assert tabs and refresh
+    middle = (tabs[-1].right() + refresh.left()) / 2.0
+    assert abs(status[0].center().x() - middle) <= 0.5, (status[0], middle)
+    win.close()
+    win.deleteLater()
+
+
 def check_tray_labels() -> None:
     from island.tray import Tray
 
@@ -964,6 +1750,7 @@ def main() -> int:
     app = QApplication(sys.argv[:1])
     check_ring_gauge()
     check_music_states()
+    check_battery_slot()
     check_seek_drag()
     check_lyrics_motion()
     check_mail_timeout()
@@ -971,8 +1758,15 @@ def main() -> int:
     check_compact_width()
     check_compact_motion()
     check_reminders()
+    check_meeting_offer()
+    check_stock_session_chip()
+    check_todo_meeting_detail()
+    check_todo_dot_needs_confirm()
+    check_tools_default_subpage()
+    check_tools_notify_dot()
     check_notice_pet_clip()
     check_refresh_feedback()
+    check_mail_flag_feedback()
     check_clock_text()
     check_weather_slot()
     check_lyric_wrap()
@@ -982,6 +1776,8 @@ def main() -> int:
     check_settings_dialog()
     check_monitor_off()
     check_line_status()
+    check_button_ink_centered()
+    check_mail_status_centered()
     check_tray_labels()
     cfg = dict(config.DEFAULTS)
     cell_w, cell_h = 470, 174

@@ -256,11 +256,28 @@ def mark_seen(cfg, uid=None, seen=True):
         if uid is None:
             _, data = box.uid("search", None, "UNSEEN")
             ids = data[0].split() if data and data[0] else []
-            if ids:
-                box.uid("store", b",".join(ids), "+FLAGS", "(\\Seen)")
+            if not ids:
+                return {"status": "ok", "message": "没有未读邮件"}
+            typ, rows = box.uid("store", b",".join(ids), "+FLAGS",
+                                "(\\Seen)")
         else:
-            box.uid("store", str(uid), "+FLAGS" if seen else "-FLAGS",
-                    "(\\Seen)")
+            typ, rows = box.uid("store", str(uid),
+                               "+FLAGS" if seen else "-FLAGS", "(\\Seen)")
+        if typ != "OK":
+            detail = b" ".join(_parts(rows)).decode("utf-8", "ignore").strip()
+            return {"status": "error",
+                    "error": detail or "服务器拒绝修改已读状态"}
+        if uid is not None:
+            blob = b" ".join(_parts(rows))
+            if b"FLAGS" not in blob:
+                # 少数服务器 STORE 成功但不回 FLAGS，再读一次确认
+                _, rows = box.uid("fetch", str(uid), "(FLAGS)")
+            blob = b" ".join(_parts(rows))
+            if not blob:
+                return {"status": "error", "error": "邮件已不在收件箱，未同步"}
+            flags = _flags_part(rows)
+            if b"FLAGS" in blob and (b"\\Seen" in flags) != bool(seen):
+                return {"status": "error", "error": "服务器未接受已读状态修改"}
         return {"status": "ok",
                 "message": "已同步已读状态" if seen else "已同步未读状态"}
     except Exception as exc:

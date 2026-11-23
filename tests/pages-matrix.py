@@ -1,4 +1,4 @@
-"""Render the nine expanded pages to one PNG. Offscreen, no desktop needed.
+"""Render every expanded page to one PNG. Offscreen, no desktop needed.
 
     QT_QPA_PLATFORM=offscreen .build-venv/bin/python tests/pages-matrix.py
 """
@@ -30,6 +30,17 @@ def calendar_event(base, hour, summary):
             "end": start + timedelta(hours=1), "all_day": False, "place": ""}
 
 
+def forecast_days(base):
+    kinds = (("小雨", "rain"), ("多云", "cloud"), ("晴", "sun"),
+             ("阴", "cloud"), ("阵雨", "rain"), ("晴", "sun"),
+             ("多云", "cloud"))
+    return [{"date": (base + timedelta(days=index)).strftime("%Y-%m-%d"),
+             "text": text, "kind": kind, "code": 61 + index,
+             "high": 16.0 - index * 0.6, "low": 8.0 + index * 0.3,
+             "precip": 10.0 * index} for index, (text, kind) in
+            enumerate(kinds)]
+
+
 def main():
     app = QApplication([])
     win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
@@ -39,7 +50,10 @@ def main():
                   "memory": 0.37, "cpu": 0.83, "disk": 0.62, "temperature": 54,
                   "gpu": None, "net_down": 1_240_000, "net_up": 320_000,
                   "online": True,
-                  "weather": {"temp": 13, "text": "小雨", "place": "长沙"}})
+                  "weather": {"temp": 13, "text": "小雨", "place": "长沙",
+                              "region": "湖南", "feels": 11, "humidity": 78,
+                              "wind": 9, "high": 16, "low": 9,
+                              "at": now - 300, "daily": forecast_days(base)}})
     win.set_music({"title": "晴天", "artist": "周杰伦", "status": "Playing",
                    "position": 42, "length": 215, "can_seek": True,
                    "player": "org.mpris.MediaPlayer2.spotify",
@@ -94,6 +108,13 @@ def main():
                       "reset_text": "3 个权益包"}],
          "usage": {"today": 520_000, "sessions": 5},
          "note": "官方积分"}]})
+    win.set_stock({"status": "ok", "code": "sh000001", "name": "上证指数",
+                   "price": 3587.83, "prev_close": 3584.58, "change": 3.25,
+                   "change_pct": 0.09, "high": 3596.55, "low": 3560.45,
+                   "at": "16:15",
+                   "points": [["0930", 3596.55], ["1000", 3580.12],
+                              ["1100", 3592.40], ["1330", 3560.45],
+                              ["1430", 3590.20], ["1500", 3587.83]]})
     win.add_notification({"app": "微信", "summary": "在吗", "body": "",
                           "at": "12:28"})
     win.set_expanded(True, animate=False)
@@ -106,10 +127,11 @@ def main():
         time.sleep(0.3)
         app.processEvents()
         grabs.append(win.grab())
-    assert len(grabs) == 9 and all(not pix.isNull() for pix in grabs)
+    assert len(grabs) == len(PAGES) and all(not pix.isNull() for pix in grabs)
 
     cell_w, cell_h, gap = 452, 156, 16
-    sheet = QImage(cell_w * 3 + gap * 2 + 16, cell_h * 3 + gap * 2 + 16,
+    rows = (len(grabs) + 2) // 3
+    sheet = QImage(cell_w * 3 + gap * 2 + 16, cell_h * rows + gap * (rows - 1) + 16,
                    QImage.Format_ARGB32)
     sheet.fill(QColor("#202430"))
     painter = QPainter(sheet)

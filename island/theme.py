@@ -112,6 +112,16 @@ class Theme:
             colors["accent"] = QColor(accent)
         return Theme(self.id, self.name, self.material, colors)
 
+    def with_alpha(self, alpha: float) -> "Theme":
+        """Same skin, different surface opacity."""
+        material = dict(self.material)
+        material["alpha"] = float(alpha)
+        return Theme(self.id, self.name, material, self.colors)
+
+    def default_alpha(self) -> int:
+        """Skin's own opacity as a 0-100 percent, for the settings default."""
+        return round(float(self.material.get("alpha", 0.6)) * 100)
+
 
 def list_themes() -> list:
     return sorted(path.stem for path in themes_dir().glob("*.json"))

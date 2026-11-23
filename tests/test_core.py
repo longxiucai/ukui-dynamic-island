@@ -15,8 +15,8 @@ os.environ["UKUI_ISLAND_CONFIG_DIR"] = tempfile.mkdtemp() + "/config"
 os.environ["UKUI_ISLAND_STATE_DIR"] = tempfile.mkdtemp() + "/state"
 
 from island import (activity, calendar, config, geometry, lyrics, mail, motion,
-                    music, productivity, quota, render, sources, theme,
-                    weather)  # noqa: E402
+                    meeting, music, productivity, quota, render, sources,
+                    stock, theme, weather)  # noqa: E402
 
 
 def test_themes():
@@ -67,6 +67,7 @@ def test_config_roundtrip():
                 "mail_user": "me@example.com", "mail_password": "secret",
                 "calendar_url": "/tmp/a.ics", "quota_url": "http://127.0.0.1/q",
                 "quota_token": "relay-secret",
+                "stock_code": "600519", "show_stock": False,
                 "focus_minutes": 45, "rest_minutes": 10,
                 "focus_remind": False, "water_remind": False,
                 "water_minutes": 60, "mail_remind": False,
@@ -78,6 +79,7 @@ def test_config_roundtrip():
     assert loaded["theme"] == "cream" and loaded["style"] == "capsule"
     assert loaded["scale"] == 140 and loaded["clock_12h"] is True
     assert loaded["clock_period"] == 2
+    assert loaded["stock_code"] == "sh600519" and loaded["show_stock"] is False
     assert loaded["show_weekday"] is True and loaded["clock_english"] is True
     assert loaded["show_weather"] is False
     assert loaded["show_monitor"] is False
@@ -93,6 +95,7 @@ def test_config_roundtrip():
     assert oct(os.stat(config.config_path()).st_mode & 0o777) == "0o600"
     config.config_path().write_text("{not json")
     assert config.load() == config.DEFAULTS
+    assert "JSONDecodeError" in config.LOAD_ERROR
 
 
 def test_spring_and_morph():
@@ -153,6 +156,29 @@ def test_sources_and_weather():
                                 "weatherDesc": [{"value": "Partly cloudy"}]}]}, "北京")
     assert parsed["temp"] == 12.4 and parsed["text"] == "多云"
     assert weather.parse_current({}) is None
+    assert weather.text_for_code(61) == "小雨"
+    parsed = weather.parse_forecast({
+        "current": {"temperature_2m": 10.2, "weather_code": 3,
+                    "relative_humidity_2m": 81, "wind_speed_10m": 1.3,
+                    "apparent_temperature": 9.2},
+        "daily": {"time": ["2026-11-19", "2026-11-20"],
+                  "weather_code": [3, 61],
+                  "temperature_2m_max": [16.8, 15.9],
+                  "temperature_2m_min": [8.0, 7.1],
+                  "precipitation_probability_max": [10, 80],
+                  "sunrise": ["2026-11-19T06:52"],
+                  "sunset": ["2026-11-19T17:38"]}},
+        {"name": "北京", "region": "北京"})
+    assert parsed["text"] == "阴" and len(parsed["daily"]) == 2
+    assert parsed["daily"][1]["text"] == "小雨"
+    assert parsed["daily"][0]["high"] == 16.8
+    thread = weather.Weather({"weather_city": "北京"})
+    thread.refresh()
+    assert thread._force and thread._wake.is_set()
+    weather._cache_path().write_text("{bad cache", encoding="utf-8")
+    errors = []
+    assert weather.load_cache(None, "北京", errors) is None
+    assert errors and "JSONDecodeError" in errors[0]
 
 
 def test_music_metadata():
@@ -222,6 +248,47 @@ def test_productivity_store():
     assert again.clear_done_todos() is None and again.todos[0]["text"] == "买牛奶"
     assert again.remove_todo(0) and again.remove_clip(0)
     assert again.remove_shelf(0) and not again.todos and not again.shelf
+    broken = Path(tempfile.mkdtemp()) / "productivity.json"
+    broken.write_text("{bad json", encoding="utf-8")
+    failed = productivity.Productivity(broken)
+    assert failed.load_error and not failed.todos
+
+
+def test_logging():
+    from island import app as island_app
+
+    log = config.state_dir() / "island.log"
+    if log.exists():
+        log.unlink()
+    island_app._log("probe", "WARN")
+    fake = object.__new__(island_app.IslandApp)
+    fake._issues = {}
+    fake._report_issue("weather", "offline")
+    fake._report_issue("weather", "offline")
+    fake._report_issue("weather", "timeout")
+    fake._clear_issue("weather")
+    fake._source_status("stock", {"status": "error", "error": "boom"},
+                        "sh000001")
+    fake._source_status("stock", {"status": "ok"})
+
+    class Window:
+        def set_weather(self, value):
+            pass
+
+    fake.window = Window()
+    fake._on_weather({"place": "北京", "temp": None, "stale": True,
+                      "error": "Timeout"})
+    fake._on_weather({"place": "北京", "temp": 12, "stale": True})
+    fake._on_weather({"place": "北京", "temp": 12, "stale": False})
+    text = log.read_text(encoding="utf-8")
+    assert "[WARN]" in text and "probe" in text
+    assert text.count("weather: offline") == 1
+    assert "weather: timeout" in text
+    assert "weather: recovered" in text
+    assert "stock: sh000001: boom" in text
+    assert "stock: recovered" in text
+    assert "weather: Timeout" in text
+    assert "weather: recovered" in text
 
 
 def test_todo_repeat_and_clip_pin():
@@ -289,6 +356,104 @@ def test_mail_parsing():
     assert mail.trash_folder(Box()) == "Deleted Messages"
 
 
+def test_mail_mark_seen_reply():
+    # mark_seen 必须看服务器回包，不能把自己当成功
+    class Box:
+        def __init__(self, typ, rows, fetch=None):
+            self.typ, self.rows, self.fetch = typ, rows, fetch
+            self.stored = []
+        def login(self, user, password):
+            pass
+        def select(self, mailbox, readonly=False):
+            self.readonly = readonly
+            return "OK", [b"1"]
+        def uid(self, cmd, *args):
+            self.stored.append((cmd,) + args)
+            if cmd == "store":
+                return self.typ, self.rows
+            if cmd == "search":
+                return "OK", [b"4 5"]
+            return "OK", (self.fetch if self.fetch is not None
+                          else [b"4 (UID 4 FLAGS (\\Seen))"])
+        def logout(self):
+            pass
+
+    cfg = {"mail_host": "h", "mail_user": "u", "mail_password": "p"}
+    original = mail._open_box
+    try:
+        box = Box("OK", [b"4 (UID 4 FLAGS ())"])
+        mail._open_box = lambda c: box
+        ok = mail.mark_seen(cfg, "4", False)
+        assert ok["status"] == "ok", ok
+        assert box.stored[0][:3] == ("store", "4", "-FLAGS"), box.stored
+        assert box.readonly is False
+        # 服务器回 NO：报错，不能报“已同步”
+        mail._open_box = lambda c: Box("NO", [b"Store rejected"])
+        bad = mail.mark_seen(cfg, "4", False)
+        assert bad["status"] == "error" and "rejected" in bad["error"], bad
+        # 服务器说改了但 FLAGS 里还有 \Seen：报错
+        mail._open_box = lambda c: Box("OK", [b"4 (UID 4 FLAGS (\\Seen))"])
+        liar = mail.mark_seen(cfg, "4", False)
+        assert liar["status"] == "error", liar
+        # 完全不回包：邮件已不在收件箱
+        mail._open_box = lambda c: Box("OK", [None], fetch=[None])
+        gone = mail.mark_seen(cfg, "4", False)
+        assert gone["status"] == "error" and "收件箱" in gone["error"], gone
+        # 全部已读仍然按回包判断
+        rows = [b"4 (FLAGS (\\Seen))", b"5 (FLAGS (\\Seen))"]
+        mail._open_box = lambda c: Box("OK", rows)
+        assert mail.mark_seen(cfg)["status"] == "ok"
+    finally:
+        mail._open_box = original
+
+
+def test_mail_operation_queue():
+    # 上一条写操作还在跑时，新点击不能悄悄丢掉
+    from island import app as island_app
+
+    started = []
+
+    class Worker:
+        busy = [False]
+
+        def __init__(self, cfg, action, uid=None, parent=None):
+            self.action, self.uid = action, uid
+            self.done, self.finished = _Sig(), _Sig()
+        def isRunning(self):
+            return Worker.busy[0]
+        def start(self):
+            started.append((self.action, self.uid))
+            Worker.busy[0] = True
+
+    class _Sig:
+        def __init__(self):
+            self.slots = []
+        def connect(self, slot):
+            self.slots.append(slot)
+        def fire(self):
+            for slot in self.slots:
+                slot()
+
+    fake = object.__new__(island_app.IslandApp)
+    fake.cfg = {}
+    fake._mail_worker = None
+    fake._mail_pending_op = None
+    fake._on_mail_operation = lambda result: None
+    original = island_app.MailAction
+    island_app.MailAction = Worker
+    try:
+        fake._mail_operation("seen", "7")
+        assert started == [("seen", "7")], started
+        fake._mail_operation("unseen", "8")   # 还在跑，先排队
+        assert started == [("seen", "7")], started
+        fake._mail_worker.finished.fire()     # 上一条跑完
+        assert started == [("seen", "7"), ("unseen", "8")], started
+        assert fake._mail_pending_op is None
+    finally:
+        island_app.MailAction = original
+        Worker.busy[0] = False
+
+
 def test_calendar_parsing():
     tomorrow = datetime.now().date() + timedelta(days=1)
     day_after = tomorrow + timedelta(days=1)
@@ -316,6 +481,204 @@ def test_calendar_parsing():
     assert calendar.load_calendar("/missing.ics")["status"] == "error"
     assert calendar.load_calendar("")["status"] == "unconfigured"
     assert mail.fetch_inbox("", 993, "", "")["status"] == "unconfigured"
+
+
+def test_stock_parsing():
+    fields = (["1", "上证指数", "000001", "3587.83", "3584.58", "3596.55",
+               "423934832"] + ["0"] * 23
+              + ["20261118161500", "3.25", "0.09", "3596.55", "3560.45"])
+    quote = stock.parse_quote('v_sh000001="' + "~".join(fields) + '";')
+    assert quote["status"] == "ok" and quote["name"] == "上证指数"
+    assert quote["price"] == 3587.83 and quote["change_pct"] == 0.09
+    assert quote["high"] == 3596.55 and quote["at"] == "16:15"
+    hk = list(fields)
+    hk[30] = "2026/11/18 16:08:10"
+    assert stock.parse_quote('v_hk00700="' + "~".join(hk) + '";')["at"] == "16:08"
+    payload = {"data": {"sh000001": {"data": {
+        "date": "20261118",
+        "data": ["0930 3596.55 1 1", "0931 3582.44 2 2"]}}}}
+    assert stock.parse_minutes(payload, "sh000001") == [
+        ["0930", 3596.55], ["0931", 3582.44]]
+    assert stock.normalize_code("600519") == "sh600519"
+    assert stock.normalize_code("000858") == "sz000858"
+    assert stock.normalize_code("00700") == "hk00700"
+    assert stock.normalize_code("AAPL") == "usAAPL"
+    assert stock.normalize_code("sh000001") == "sh000001"
+    assert stock.normalize_code("no way") == ""
+    assert quote["date"] == "20261118"
+
+
+def _at(day, hour, minute):
+    return day.replace(hour=hour, minute=minute)
+
+
+def test_stock_session():
+    assert stock.stamp_date("20261119161427") == "20261119"
+    assert stock.stamp_date("2026-11-18 16:08:13") == "20261118"
+    assert stock.stamp_date("") == ""
+    monday = datetime(2026, 11, 16)
+    assert stock.in_session("sh000001", _at(monday, 9, 30))
+    assert stock.in_session("sh000001", _at(monday, 12, 0))
+    assert stock.in_session("sh000001", _at(monday, 15, 14))
+    assert not stock.in_session("sh000001", _at(monday, 15, 15))
+    assert not stock.in_session("sh000001", _at(monday, 9, 29))
+    assert stock.in_session("sh000001", _at(monday, 15, 40), grace_minutes=60)
+    assert not stock.in_session("sh000001", _at(monday, 15, 0), grace_minutes=0)
+    weekend = monday + timedelta(days=6)
+    assert not stock.in_session("sh000001", _at(weekend, 10, 0))
+    assert stock.in_session("hk00700", _at(monday, 15, 50))
+    assert not stock.in_session("hk00700", _at(monday, 16, 20))
+    # 美股 09:30-16:00 EST = 本机 22:30 至次日 05:00（11 月非夏令）
+    assert stock.in_session("usAAPL", _at(monday, 23, 0))
+    assert not stock.in_session("usAAPL", _at(monday, 22, 0))
+    assert stock.in_session("usAAPL", _at(monday + timedelta(days=1), 4, 0))
+    july = datetime(2026, 7, 15)  # 夏令时：09:30 EDT = 本机 21:30
+    assert stock.in_session("usAAPL", _at(july, 22, 0))
+    assert not stock.in_session("usAAPL", _at(july, 21, 0))
+    assert stock.in_session("unknown", _at(monday, 3, 0))
+    assert stock.quote_fresh("sh000001", "20261116", monday)
+    assert not stock.quote_fresh("sh000001", "20261113", monday)
+    assert stock.quote_fresh("sh000001", "", monday)
+    assert stock.chip_visible("sh000001", "20261116", _at(monday, 15, 10))
+    assert not stock.chip_visible("sh000001", "20261116", _at(monday, 15, 10),
+                                  grace_minutes=0)
+    assert not stock.chip_visible("sh000001", "20261116", _at(monday, 15, 30))
+    assert not stock.chip_visible("sh000001", "20261113", _at(monday, 10, 0))
+    assert stock.chip_visible("sh000001", "20261113", _at(monday, 10, 0),
+                              enabled=False)
+
+
+def test_meeting_invite():
+    now = datetime.now()
+    later = (now + timedelta(days=3)).strftime("%Y/%m/%d")
+    soon = now.replace(hour=min(23, now.hour + 1), minute=0)
+    invite = ("温建春 邀请您参加腾讯会议\n"
+              "会议主题：中行生产物料交付评审\n"
+              f"会议时间：{later} 09:20-09:50 (GMT+08:00) 中国标准时间 - 北京\n\n"
+              "点击链接入会，或添加至会议列表：\n"
+              "https://meeting.tencent.com/dm/arNC46twIeG3\n\n"
+              "#腾讯会议：902-631-704\n\n"
+              "复制该信息，打开手机腾讯会议即可参与")
+    got = meeting.parse_meeting(invite)
+    assert got["text"].endswith("中行生产物料交付评审"), got
+    assert got["code"] == "902631704", got
+    assert got["remind_on"] == (now + timedelta(days=3)).date().isoformat(), got
+    short = meeting.parse_meeting(
+        f"会议主题：中行生产环境备份功能沟通\n"
+        f"会议时间：{soon:%Y/%m/%d} {soon:%H:%M}-17:45\n"
+        "#腾讯会议：370-268-672")
+    assert short["remind"] == f"{soon:%H:%M}", short
+    assert short["remind_on"] == soon.date().isoformat(), short
+    assert short["code"] == "370268672", short
+    gone = meeting.parse_meeting(
+        f"会议主题：昨天的会\n会议时间：{now - timedelta(days=1):%Y/%m/%d} "
+        "09:00-09:30")
+    assert gone["remind"] == "" and gone["remind_on"] == "", gone
+    assert gone["past"], gone
+    assert meeting.parse_meeting("会议主题：季度复盘\n会议时间：12 月 30 日") is None
+    assert meeting.parse_meeting("复制的文字 会议 902-631-704") is None
+    assert meeting.parse_meeting("") is None
+
+
+def test_meeting_notice():
+    notice = ("@全体成员 关于召开全体党员大会的通知\n\n"
+              "支部全体党员：\n"
+              "  定于2099年11月12日召开全体党员大会。现将有关事项通知如下：\n"
+              "   一、时间2099年11月12日（星期五）下午16：00\n"
+              "   二、地点\n"
+              "   北京   1102会议室\n"
+              "   天津 北斗1104会议室\n"
+              "其余地区蓝信接入，蓝信会议号  910115509386\n"
+              "   三、参加人员\n   支部全体党员\n")
+    got = meeting.parse_meeting(notice)
+    assert got["title"] == "关于召开全体党员大会的通知", got
+    assert got["text"] == "11/12 16:00 关于召开全体党员大会的通知", got
+    assert got["remind"] == "16:00" and got["remind_on"] == "2099-11-12", got
+    assert got["place"] == "北京 1102会议室；天津 北斗1104会议室", got
+    assert got["code"] == "910115509386", got
+    assert meeting.parse_meeting("2099年11月12日的会议改期，另定时间") is None
+    assert meeting.parse_meeting("会议通知：明天上午开会") is None
+
+
+def test_meeting_notice_markdown_copy():
+    """A rich-text copy keeps literal backslash line breaks and &#x20;."""
+    escaped = ("@全体成员 关于召开全体党员大会的通知\\\n\\\n"
+               "支部全体党员：\\\n&#x20;   一、时间2099年11月12日（星期五）下午16：00\\\n"
+               "&#x20;   二、地点\\\n&#x20;   北京   1102会议室\\\n"
+               "&#x20;   天津 北斗1104会议室\\\n其余地区蓝信接入，蓝信会议号  910115509386\\\n"
+               "&#x20;   三、参加人员\\\n&#x20;  1\\. 参会时请佩戴党徽。")
+    got = meeting.parse_meeting(escaped)
+    assert got["title"] == "关于召开全体党员大会的通知", got
+    assert "\\" not in got["text"], got
+    assert got["place"] == "北京 1102会议室；天津 北斗1104会议室", got
+    assert got["code"] == "910115509386", got
+    assert meeting._plain(r"会议主题：C:\Users\lyx\n会议时间：2099-01-01 09:20") == (
+        r"会议主题:C:\Users\lyx\n会议时间:2099-01-01 09:20")
+
+
+def test_todo_meeting_details():
+    invite = ("会议主题：交付评审\n会议时间：2099-01-01 09:20-09:50\n"
+              "入会链接：https://meeting.tencent.com/dm/abc123，\n"
+              "#腾讯会议：902-631-704\n会议地点：3 楼 302 会议室")
+    got = meeting.parse_meeting(invite)
+    assert got["code"] == "902631704", got
+    assert got["place"] == "3 楼 302 会议室", got
+    assert got["link"] == "https://meeting.tencent.com/dm/abc123", got
+    assert meeting.parse_meeting("会议主题：无地点\n会议时间：2099-01-01 09:20")[
+        "place"] == ""
+
+    path = Path(tempfile.mkdtemp()) / "productivity.json"
+    store = productivity.Productivity(path)
+    assert store.add_todo("评审", None, "09:20", "2099-01-01", got)
+    saved = store.todos[0]["meeting"]
+    assert saved["code"] == "902631704" and saved["place"] == "3 楼 302 会议室"
+    assert store.add_todo("超长", None, "", "", {
+        "code": "9" * 80, "place": "房" * 80, "link": "u" * 400, "junk": "x"})
+    capped = store.todos[0]["meeting"]
+    assert len(capped["code"]) == 32 and len(capped["place"]) == 60
+    assert len(capped["link"]) == 300 and "junk" not in capped
+    assert productivity.clean_meeting(None) == {}
+    assert productivity.clean_meeting("不是字典") == {}
+    again = productivity.Productivity(path)
+    assert again.todos[1]["meeting"]["code"] == "902631704"
+
+
+def test_todo_remind_on():
+    path = Path(tempfile.mkdtemp()) / "productivity.json"
+    store = productivity.Productivity(path)
+    today = date(2026, 11, 20)
+    later = today + timedelta(days=2)
+    assert store.add_todo("11/22 09:20 后天的评审", None, "09:20",
+                          later.isoformat())
+    assert store.add_todo("11/20 14:00 今天的评审", None, "14:00",
+                          today.isoformat())
+    today_item, later_item = store.todos[0], store.todos[1]
+    assert today_item["remind_on"] == today.isoformat()
+    assert later_item["remind_on"] == later.isoformat()
+    # 只有当天的 dated 待办算今日，非当天的不污染进度也不排前面
+    assert store.progress(today) == (0, 1)
+    assert store.progress(later) == (0, 1)
+    assert store.progress(today + timedelta(days=1)) == (0, 0)
+    assert store.display_order(today)[0] == 0
+    assert store.todo_due(today_item, today)
+    assert not store.todo_due(today_item, later)
+    assert not store.todo_due(later_item, today)
+    assert store.todo_due(later_item, later)
+    # 过期了也还能勾掉
+    assert store.toggle_todo(0, today) and store.toggle_todo(1, today)
+    assert store.progress(today) == (1, 1), "非当天的不计入今日"
+    assert store.progress(later) == (1, 1)
+    again = productivity.Productivity(path)
+    assert [item["remind_on"] for item in again.todos] == [
+        today.isoformat(), later.isoformat()]
+    # 没有 remind_on 的旧数据按原样走重复判定
+    legacy = {"text": "老待办", "done": False, "repeat": [], "done_on": "",
+              "remind": "14:00"}
+    assert store.todo_due(legacy, today) and store.todo_due(legacy, later)
+    # 手动设了重复就按重复走，日期不再压住它
+    both = {"text": "每天但带日期", "done": False, "repeat": list(range(7)),
+            "done_on": "", "remind": "14:00", "remind_on": today.isoformat()}
+    assert store.todo_due(both, today) and store.todo_due(both, later)
 
 
 def test_quota_parsing():
@@ -852,9 +1215,18 @@ if __name__ == "__main__":
     test_sources_and_weather()
     test_music_metadata()
     test_productivity_store()
+    test_logging()
     test_todo_repeat_and_clip_pin()
     test_mail_parsing()
+    test_meeting_invite()
+    test_meeting_notice()
+    test_todo_remind_on()
+    test_todo_meeting_details()
+    test_mail_mark_seen_reply()
+    test_mail_operation_queue()
     test_calendar_parsing()
+    test_stock_parsing()
+    test_stock_session()
     test_quota_parsing()
     test_codex_quota_snapshot_and_claude_history()
     test_workbuddy_usage()

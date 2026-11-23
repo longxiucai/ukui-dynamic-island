@@ -3,12 +3,15 @@ from string import Template
 
 from PySide2.QtCore import Qt, QTimer, QUrl
 from PySide2.QtGui import QColor, QDesktopServices, QPainter, QPen
-from PySide2.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog,
+from PySide2.QtWidgets import (QAbstractScrollArea, QApplication,
+                               QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QPushButton, QScrollArea,
-                               QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                               QSlider, QSpinBox, QTabWidget, QVBoxLayout,
+                               QWidget)
 
-from island import __version__, blur, quota
+from island import __version__, blur, quota, stock, theme, weather
+from island.window import IslandWindow
 
 
 def _rgba(color):
@@ -16,18 +19,100 @@ def _rgba(color):
             f"{color.alpha() / 255:.3f})")
 
 
+def _blend(base, overlay):
+    """overlay 压在 base 上的结果色，用来预演半透明叠加。"""
+    ratio = overlay.alpha() / 255.0
+    channels = ((base.red(), overlay.red()), (base.green(), overlay.green()),
+                (base.blue(), overlay.blue()))
+    return QColor(*[round(low + (high - low) * ratio)
+                    for low, high in channels])
+
+
+def _ink_on(accent, ink):
+    """12px 粗体按 WCAG 要 4.5:1；皮肤的 onAccent 压不住 accent 时往深色推。"""
+    best = ink
+    if theme.contrast(ink, accent) >= 4.5:
+        return best
+    light = ink.lightness() >= 128
+    target = QColor(255, 255, 255) if light else QColor(0, 0, 0)
+    for step in range(1, 9):
+        cand = _blend(ink, QColor(target.red(), target.green(), target.blue(),
+                                  step * 32))
+        if theme.contrast(cand, accent) >= 4.5:
+            return cand
+    return QColor(target.red(), target.green(), target.blue())
+
+
+def _body_color(th):
+    """岛面实际会画出来的颜色（玻璃/悬浮云是带透明度的 tint）。"""
+    kind = th.material.get("kind", "opaque")
+    if kind == "opaque":
+        return th.color("surface")
+    body = QColor(th.material.get("tint", "#FFFFFF"))
+    body.setAlphaF(float(th.material.get("alpha", 0.6)))
+    return body
+
+
+def _preview_stage(th):
+    """预览底色：岛面是半透明的，$fill 压不出对比就会融进背景，
+    所以按实际会画出来的颜色往反方向推，直到对比到 1.6:1。"""
+    body = _body_color(th)
+    flat = QColor(body.red(), body.green(), body.blue())
+    target = (QColor(0, 0, 0) if flat.lightness() > 128
+              else QColor(255, 255, 255))
+    best = flat
+    best_ratio = theme.contrast(flat, _blend(flat, body))
+    for step in range(1, 17):
+        shade = QColor(target.red(), target.green(), target.blue(), step * 14)
+        stage = _blend(flat, shade)
+        ratio = theme.contrast(stage, _blend(stage, body))
+        if ratio >= 1.6:
+            return stage.name()
+        if ratio > best_ratio:
+            best, best_ratio = stage, ratio
+    # 透明度很低时岛本来就快看不见了，取能拉开的最大对比
+    return best.name()
+
+
+def _hand_off_wheel(widget, event):
+    """滚轮掠过数字框/下拉框时翻页，而不是顺手改掉一个配置值。"""
+    area = widget.parentWidget()
+    while area is not None and not isinstance(area, QAbstractScrollArea):
+        area = area.parentWidget()
+    if area is None:
+        event.ignore()
+        return
+    QApplication.sendEvent(area.viewport(), event)
+
+
+# 注意：QSS 不认非整数 px（10.5px 整条被丢弃，回落到 QWidget 的 12px），
+# 阶梯只能用整数；也不要在这里写注释，Qt 的解析器会吞掉后面的规则。
 STYLE = Template("""
 QDialog { background: $surface; }
 QWidget { color: $textPrimary; font-size: 12px; }
 QLabel { background: transparent; color: $textSecondary; }
 QLabel#section { color: $textTertiary; font-size: 11px; font-weight: 600; }
-QLabel#hint { color: $textTertiary; font-size: 10.5px; }
+QLabel#hint { color: $textTertiary; font-size: 11px; }
 QLabel#status { color: $textSecondary; font-size: 11px; }
 QLabel#status[state="ok"] { color: $success; }
 QLabel#status[state="error"] { color: $danger; }
 QLabel#status[state="warn"] { color: $warning; }
-QLabel#preview { background: $fill; border: 1px solid $hairline;
-                 border-radius: 10px; color: $textTertiary; font-size: 10.5px; }
+QLabel#preview { background: $previewStage; border: 1px solid $hairline;
+                 border-radius: 10px; color: $textTertiary; font-size: 11px; }
+QFrame#card { background: $input; border: 1px solid $hairline;
+              border-radius: 10px; }
+QLabel#cardTitle { color: $textPrimary; font-size: 13px; font-weight: 600; }
+QLabel#cardState { color: $textTertiary; font-size: 11px; }
+QLabel#cardState[state="ok"] { color: $success; }
+QLabel#cardState[state="warn"] { color: $warning; }
+QLabel#cardState[state="error"] { color: $danger; }
+QFrame#weatherHero { background: $fill; border: 1px solid $hairline;
+                     border-radius: 12px; }
+QLabel#weatherTemp { color: $textPrimary; font-size: 32px;
+                     font-weight: 600; }
+QLabel#weatherPlace { color: $textPrimary; font-size: 13px;
+                      font-weight: 600; }
+QLabel#weatherText { color: $textSecondary; font-size: 12px; }
 QTabWidget::pane { border: 1px solid $hairline; border-radius: 12px;
                    background: $popup; top: -1px; }
 QTabBar::tab { background: transparent; color: $textSecondary;
@@ -75,12 +160,32 @@ QPushButton#segment { background: transparent; color: $textSecondary;
 QPushButton#segment:hover { background: $hover; color: $textPrimary; }
 QPushButton#segment:checked { background: $accent; color: $onAccent;
                               border-color: $accent; font-weight: 600; }
+QPushButton#cityRow { text-align: left; padding: 6px 12px;
+                      background: $input; }
+QPushButton#cityRow:hover { background: $hover; }
+QPushButton#cityRow:checked { background: $accentSoft;
+                              border-color: $accentLine; font-weight: 600; }
+QPushButton#cityRow:focus { border-color: $accent; }
+QPushButton#cityRemove { background: transparent; border: 0; padding: 0;
+                         min-width: 26px; max-width: 26px;
+                         color: $textTertiary; font-size: 14px; }
+QPushButton#cityRemove:hover { background: $hover; color: $danger; }
 QScrollArea { background: transparent; border: none; }
 QScrollArea > QWidget > QWidget { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
 QScrollBar::handle:vertical { background: $outline; border-radius: 4px;
                               min-height: 24px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QSlider { background: transparent; min-height: 18px; }
+QSlider::groove:horizontal { height: 4px; border-radius: 2px;
+                             background: $track; }
+QSlider::sub-page:horizontal { height: 4px; border-radius: 2px;
+                               background: $accent; }
+QSlider::handle:horizontal { background: $popup; width: 12px; height: 12px;
+                             margin: -5px 0; border-radius: 7px;
+                             border: 1px solid $controlBorder; }
+QSlider::handle:horizontal:hover,
+QSlider::handle:horizontal:pressed { border-color: $accent; }
 """)
 
 
@@ -98,6 +203,9 @@ class Combo(QComboBox):
         self.view().window().setStyleSheet(
             "QComboBoxPrivateContainer { background: %s; border: 0px; }"
             % self.popup_color)
+
+    def wheelEvent(self, event):
+        _hand_off_wheel(self, event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -142,6 +250,9 @@ class Spin(QSpinBox):
             return
         super().mousePressEvent(event)
 
+    def wheelEvent(self, event):
+        _hand_off_wheel(self, event)
+
 
 class Check(QCheckBox):
     """QCheckBox with a painted tick; the QSS only fills the box."""
@@ -163,8 +274,31 @@ class Check(QCheckBox):
         painter.drawLine(6.5, top + 10.5, 11.5, top + 4.5)
 
 
+class Slider(QSlider):
+    """滑块；滚轮仍然翻页，不能顺手改掉数值。"""
+
+    def wheelEvent(self, event):
+        _hand_off_wheel(self, event)
+
+
+class Form(QFormLayout):
+    """标签列定宽：切 tab 时字段左边缘一致。"""
+
+    LABEL_W = 60
+
+    def _label(self, label):
+        if not isinstance(label, str):
+            return label
+        widget = QLabel(label)
+        widget.setMinimumWidth(self.LABEL_W)
+        return widget
+
+    def addRow(self, label, field=None):
+        super().addRow(self._label(label), field)
+
+
 class SettingsDialog(QDialog):
-    PAGE_TABS = {"mail": 2, "calendar": 3, "quota": 4}
+    PAGE_TABS = {"weather": 2, "mail": 3, "calendar": 4, "quota": 5}
 
     def __init__(self, app, parent=None):
         super().__init__(parent)
@@ -173,7 +307,9 @@ class SettingsDialog(QDialog):
         self._workbuddy_login = None
         self._trae_login = None
         self._copilot_login = None
+        self._city_search_worker = None
         self._blur_supported = None
+        self._sample = None
         self.setWindowTitle("设置")
         self.setWindowFlags(Qt.Window | Qt.WindowTitleHint
                             | Qt.WindowSystemMenuHint
@@ -186,15 +322,16 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._scroll(self._appearance(cfg)), "外观")
         self.tabs.addTab(self._scroll(self._clock(cfg)), "时间")
+        self.tabs.addTab(self._scroll(self._weather(cfg)), "天气")
         self.tabs.addTab(self._scroll(self._mail(cfg)), "邮件")
         self.tabs.addTab(self._scroll(self._calendar(cfg)), "日历")
-        self.tabs.addTab(self._scroll(self._quota(cfg)), "额度")
+        self.tabs.addTab(self._scroll(self._quota(cfg)), "AI 额度")
 
         version = QLabel(f"版本 {__version__}")
         version.setObjectName("hint")
         version.setToolTip(
             "配置 ~/.config/ukui-dynamic-island\n日志 ~/.local/state/ukui-dynamic-island")
-        close = QPushButton("完成")
+        close = QPushButton("关闭")
         close.setObjectName("primary")
         close.setDefault(True)
         close.clicked.connect(self.accept)
@@ -248,7 +385,7 @@ class SettingsDialog(QDialog):
         return lay
 
     def _form(self):
-        form = QFormLayout()
+        form = Form()
         form.setContentsMargins(0, 0, 0, 0)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -281,6 +418,9 @@ class SettingsDialog(QDialog):
     # Theme and preview
 
     def _theme(self):
+        current = getattr(self.app, "active_theme", None)
+        if current is not None:
+            return current
         theme_id = self.app.cfg.get("theme")
         return (self.app.themes.get(theme_id)
                 or next(iter(self.app.themes.values())))
@@ -294,10 +434,18 @@ class SettingsDialog(QDialog):
                      "textSecondary", "textTertiary", "accent", "onAccent",
                      "danger", "warning", "success"):
             colors[name] = th.color(name).name()
+        colors["onAccent"] = _ink_on(th.color("accent"),
+                                     th.color("onAccent")).name()
         colors["accentHover"] = th.color("accent").lighter(112).name()
+        accent = th.color("accent")
+        colors["accentSoft"] = _rgba(QColor(accent.red(), accent.green(),
+                                            accent.blue(), 40))
+        colors["accentLine"] = _rgba(QColor(accent.red(), accent.green(),
+                                            accent.blue(), 110))
         control = QColor(th.color("textSecondary"))
         control.setAlpha(115)
         colors["controlBorder"] = _rgba(control)
+        colors["previewStage"] = _preview_stage(th)
         self.setStyleSheet(STYLE.substitute(colors))
         arrow = th.color("textSecondary")
         for widget in self.findChildren(Combo) + self.findChildren(Spin):
@@ -325,14 +473,47 @@ class SettingsDialog(QDialog):
         self.blur_status.setText(
             "系统模糊可用，岛会随背景透出颜色。" if self._blur_supported
             else "当前窗口管理器未声明模糊，岛会自动回退为半透明。")
+        self._sync_glass_alpha()
 
-    def _refresh_preview(self):
-        window = getattr(self.app, "window", None)
-        if window is None:
+    def _sync_glass_alpha(self):
+        """把滑块对准当前生效值，不能触发一次新的保存。"""
+        raw = self.app.cfg.get("glass_alpha")
+        value = self._theme().default_alpha() if raw is None else int(raw)
+        self.glass_alpha.blockSignals(True)
+        self.glass_alpha.setValue(max(20, min(100, value)))
+        self.glass_alpha.blockSignals(False)
+        self._show_glass_alpha(value)
+        self.glass_reset.setEnabled(raw is not None)
+
+    def _show_glass_alpha(self, value):
+        self.glass_alpha_value.setText(f"{int(value)}%")
+
+    def _on_glass_alpha(self, value):
+        """拖动时只改标签，落盘和重绘等一会儿，免得每像素写一次配置。"""
+        self._show_glass_alpha(value)
+        self._alpha_timer.start()
+
+    def _flush_glass_alpha(self):
+        self._alpha_timer.stop()
+        self._set_glass_alpha(self.glass_alpha.value())
+
+    def _set_glass_alpha(self, value):
+        self.app.set_option("glass_alpha", value)
+        self._apply_style()
+        self._sync_glass_alpha()
+        self._refresh_preview()
+
+    def _reset_glass_alpha(self):
+        self._alpha_timer.stop()
+        self._set_glass_alpha(None)
+
+    def _grab_preview(self):
+        sample = self._sample
+        if sample is None:
             self.preview.clear()
             self.preview.setText("外观预览")
             return
-        pixmap = window.grab()
+        pixmap = sample.grab()
         if pixmap.isNull():
             return
         width = self.preview.width() - 24
@@ -344,11 +525,63 @@ class SettingsDialog(QDialog):
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation))
 
+    def _refresh_preview(self):
+        """预览画的是固定样例岛：开关一拨立刻重画，不等后台线程回信号，
+        也不依赖当前有没有真实行情或本机会话。"""
+        if self._sample is None:
+            self._sample = self._sample_window()
+        else:
+            self._sample.apply(dict(self.app.cfg, stock_hide_closed=False),
+                               self._theme())
+            self._seed_sample(self._sample)
+        self._grab_preview()
+
+    def _sample_window(self):
+        """隐藏的样例岛：只用来给预览出图，绝不 show，也不碰真岛。"""
+        sample = IslandWindow(dict(self.app.cfg, stock_hide_closed=False),
+                              self._theme())
+        sample.setAttribute(Qt.WA_DontShowOnScreen, True)
+        sample._apply_blur = lambda: None
+        self._seed_sample(sample)
+        return sample
+
+    def _seed_sample(self, sample):
+        """固定读数：预览要快、要每次一致，所以不读真实数据。"""
+        sample.productivity.todos.clear()
+        sample.set_data({"battery": 0.82, "charging": False, "volume": 0.5,
+                         "memory": 0.42, "cpu": 0.31, "disk": 0.6,
+                         "temperature": None, "gpu": None, "net_down": None,
+                         "net_up": None, "online": True,
+                         "weather": {"place": "长沙", "text": "多云",
+                                     "temp": 21}})
+        sample.set_stock({"status": "ok",
+                          "code": sample.cfg.get("stock_code", "sh000001"),
+                          "name": "上证指数", "price": 3587.83,
+                          "prev_close": 3550.0, "change": 37.83,
+                          "change_pct": 1.07, "high": 3596.55,
+                          "low": 3548.1, "date": "20260105", "at": "10:00",
+                          "points": []})
+        sample.set_activity({"provider": "Codex", "state": "working",
+                             "label": "正在执行", "detail": "", "active": True,
+                             "at": 0.0})
+        for timer in (sample.clock, sample._hover, sample._desk,
+                      sample._beat, sample._frame, sample._page_beat):
+            timer.stop()
+        sample._apply_geometry()
+
     def showEvent(self, event):
         super().showEvent(event)
+        self._sync_saved_text()
+        self._sync_material()
         self._apply_style()
         self._refresh_preview()
-        QTimer.singleShot(50, self._refresh_preview)
+
+    def _sync_saved_text(self):
+        """行情代码是即时保存的：输入框里的半成品不代表已生效的值。"""
+        code = str(self.app.cfg.get("stock_code", ""))
+        if self.stock_code.text() != code:
+            self.stock_code.setText(code)
+        self._set_status(self.stock_status, "")
 
     # Pages
 
@@ -390,33 +623,60 @@ class SettingsDialog(QDialog):
         form.addRow("形态", holder)
         look.addLayout(form)
 
-        display = self._group(outer, "显示")
+        display = self._group(outer, "收起状态显示")
+        self.monitor_on = Check("资源监控")
+        self.pet = Check("宠物")
+        self.weather_on = Check("天气与温度")
+        self.stock_on = Check("股票涨跌幅")
+        self.activity_on = Check("AI 执行状态")
+        self.battery_on = Check("电池电量")
+        rows = (("show_monitor", self.monitor_on, ""),
+                ("show_pet", self.pet, ""),
+                ("show_weather", self.weather_on, ""),
+                ("show_stock", self.stock_on, ""),
+                ("show_activity", self.activity_on,
+                 "关闭后不再读取本机会话记录"),
+                ("show_battery", self.battery_on, ""))
+        for key, widget, note in rows:
+            widget.setChecked(bool(cfg.get(key, True)))
+            widget.toggled.connect(
+                lambda on, name=key: self.app.set_option(name, on))
+            widget.toggled.connect(self._refresh_preview)
+            if note:
+                widget.setToolTip(note)
+            display.addWidget(widget)
+
+        market = self._group(outer, "股票")
         form = self._form()
-        self.city = QLineEdit(cfg["weather_city"])
-        self.city.setPlaceholderText("城市名，如 长沙")
-        self.city.editingFinished.connect(
-            lambda: self.app.set_weather_city(self.city.text()))
-        form.addRow("天气城市", self.city)
-        display.addLayout(form)
-        self.weather_on = Check("显示天气")
-        self.weather_on.setChecked(cfg["show_weather"])
-        self.weather_on.toggled.connect(self._weather_changed)
-        self.city.setEnabled(self.weather_on.isChecked())
-        self.pet = Check("显示宠物")
-        self.pet.setChecked(cfg.get("show_pet", True))
-        self.pet.toggled.connect(
-            lambda on: self.app.set_option("show_pet", on))
-        self.monitor_on = Check("显示资源监控")
-        self.monitor_on.setChecked(cfg.get("show_monitor", True))
-        self.monitor_on.toggled.connect(
-            lambda on: self.app.set_option("show_monitor", on))
-        row = QHBoxLayout()
-        row.setSpacing(18)
-        row.addWidget(self.weather_on)
-        row.addWidget(self.pet)
-        row.addWidget(self.monitor_on)
-        row.addStretch(1)
-        display.addLayout(row)
+        self.stock_code = QLineEdit(cfg.get("stock_code", "sh000001"))
+        self.stock_code.setPlaceholderText(
+            "sh000001（上证指数）/ 600519 / hk00700 / usAAPL")
+        self.stock_code.editingFinished.connect(self._save_stock_code)
+        self.stock_code.setToolTip(
+            "6 位数字按首位补 sh/sz/bj，5 位补 hk，纯字母按美股。")
+        form.addRow("行情代码", self.stock_code)
+        self.stock_grace_minutes = Spin()
+        self.stock_grace_minutes.setRange(0, 180)
+        self.stock_grace_minutes.setValue(cfg.get("stock_grace_minutes", 15))
+        self.stock_grace_minutes.setSuffix(" 分钟")
+        self.stock_grace_minutes.valueChanged.connect(
+            lambda value: self.app.set_option("stock_grace_minutes", value))
+        self.stock_grace_minutes.setToolTip("收盘后再多显示几分钟，0 即收盘就隐藏。")
+        form.addRow("收盘宽限", self.stock_grace_minutes)
+        market.addLayout(form)
+        self.stock_hide_closed = Check("休市/收盘后隐藏收起态涨跌")
+        self.stock_hide_closed.setChecked(cfg.get("stock_hide_closed", True))
+        self.stock_hide_closed.toggled.connect(
+            lambda on: self.app.set_option("stock_hide_closed", on))
+        self.stock_hide_closed.toggled.connect(
+            self.stock_grace_minutes.setEnabled)
+        self.stock_grace_minutes.setEnabled(cfg.get("stock_hide_closed", True))
+        self.stock_hide_closed.setToolTip(
+            "交易时段：沪深 09:30–15:00、港股 09:30–16:00、"
+            "美股 09:30–16:00（美东时间），周末自动隐藏；行情页不受影响。")
+        market.addWidget(self.stock_hide_closed)
+        self.stock_status = self._status("")
+        market.addWidget(self.stock_status)
 
         behaviour = self._group(outer, "启动与行为")
         self.autostart = Check("登录时自动启动")
@@ -430,11 +690,21 @@ class SettingsDialog(QDialog):
         self.click_through.setChecked(cfg.get("click_through", False))
         self.click_through.toggled.connect(
             lambda on: self.app.set_option("click_through", on))
+        # 开启后岛点不动，只靠 tooltip 提醒会让人以为程序坏了，所以开着才显示。
+        self.click_through_warn = self._status("")
+        self.click_through.toggled.connect(self._sync_click_through)
         behaviour.addWidget(self.autostart)
         behaviour.addWidget(self.fullscreen)
         behaviour.addWidget(self.click_through)
-        behaviour.addWidget(self._hint(
-            "开启鼠标穿透后，岛不再响应点击；请从托盘菜单关闭。"))
+        behaviour.addWidget(self.click_through_warn)
+        self._sync_click_through(self.click_through.isChecked())
+        self.meeting_detect = Check("复制会议邀请时询问是否创建待办")
+        self.meeting_detect.setChecked(cfg.get("meeting_detect", True))
+        self.meeting_detect.toggled.connect(
+            lambda on: self.app.set_option("meeting_detect", on))
+        self.meeting_detect.setToolTip(
+            "腾讯/飞书/企微的邀请复制后问一次，确认才写进待办。")
+        behaviour.addWidget(self.meeting_detect)
 
         self.material_box = QWidget()
         self.material_box.setAutoFillBackground(False)
@@ -451,6 +721,29 @@ class SettingsDialog(QDialog):
         material.addWidget(self.blur_on)
         self.blur_status = self._hint("")
         material.addWidget(self.blur_status)
+        self.glass_alpha = Slider(Qt.Horizontal)
+        self.glass_alpha.setRange(20, 100)
+        self.glass_alpha.setPageStep(5)
+        self.glass_alpha.valueChanged.connect(self._on_glass_alpha)
+        self.glass_alpha.sliderReleased.connect(self._flush_glass_alpha)
+        self.glass_alpha_value = QLabel("")
+        self.glass_alpha_value.setObjectName("status")
+        self.glass_alpha_value.setAlignment(Qt.AlignRight
+                                             | Qt.AlignVCenter)
+        self.glass_alpha_value.setMinimumWidth(36)
+        self.glass_reset = QPushButton("恢复皮肤默认")
+        self.glass_reset.clicked.connect(self._reset_glass_alpha)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self.glass_alpha, 1)
+        row.addWidget(self.glass_alpha_value)
+        row.addWidget(self.glass_reset)
+        material.addLayout(row)
+        self.glass_alpha.setToolTip("数值越小越透，越能透出桌面颜色。")
+        self._alpha_timer = QTimer(self)
+        self._alpha_timer.setSingleShot(True)
+        self._alpha_timer.setInterval(140)
+        self._alpha_timer.timeout.connect(self._flush_glass_alpha)
         outer.addWidget(self.material_box)
         outer.addStretch(1)
         self._sync_material()
@@ -460,12 +753,303 @@ class SettingsDialog(QDialog):
         self.app.set_style(style)
         self._refresh_preview()
 
-    def _weather_changed(self, on):
-        self.app.set_option("show_weather", on)
-        self.city.setEnabled(on)
+    def _weather(self, cfg):
+        page, outer = self._page()
+
+        hero = QFrame()
+        hero.setObjectName("weatherHero")
+        lay = QVBoxLayout(hero)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.weather_place = QLabel("天气")
+        self.weather_place.setObjectName("weatherPlace")
+        self.weather_state = QLabel("等待刷新")
+        self.weather_state.setObjectName("cardState")
+        head.addWidget(self.weather_place)
+        head.addStretch(1)
+        head.addWidget(self.weather_state)
+        lay.addLayout(head)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        self.weather_temp = QLabel("--°")
+        self.weather_temp.setObjectName("weatherTemp")
+        self.weather_text = QLabel("尚无天气数据")
+        self.weather_text.setObjectName("weatherText")
+        refresh = QPushButton("刷新")
+        refresh.clicked.connect(self._refresh_weather)
+        refresh.setToolTip("每 15 分钟自动更新；离线时保留上次天气并标灰。\n"
+                           "数据来自 Open-Meteo，自动定位用 wttr.in。")
+        body.addWidget(self.weather_temp)
+        body.addWidget(self.weather_text, 1)
+        body.addWidget(refresh)
+        lay.addLayout(body)
+        self.weather_note = self._status("")
+        lay.addWidget(self.weather_note)
+        outer.addWidget(hero)
+
+        city = self._group(outer, "城市")
+        self.city_rows = QVBoxLayout()
+        self.city_rows.setSpacing(6)
+        city.addLayout(self.city_rows)
+        self._rebuild_city_rows()
+        self.weather_status = self._status("")
+        city.addWidget(self.weather_status)
+
+        add = self._group(outer, "添加城市")
+        self.city_search = QLineEdit()
+        self.city_search.setPlaceholderText("输入城市名搜索，如 长沙 / Tokyo")
+        self.city_search.textEdited.connect(self._queue_city_search)
+        add.addWidget(self.city_search)
+        self.city_results = Combo()
+        self.city_results.currentIndexChanged.connect(self._city_pick_changed)
+        self.city_add = QPushButton("添加")
+        self.city_add.setEnabled(False)
+        self.city_add.clicked.connect(self._add_picked_city)
+        self.city_search_status = self._status("")
+        add.addWidget(self.city_search_status)
+        result = QWidget()
+        result.setAutoFillBackground(False)
+        layout = QHBoxLayout(result)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(self.city_results, 1)
+        layout.addWidget(self.city_add)
+        result.setVisible(False)
+        self.city_result_row = result
+        add.addWidget(result)
+
+        outer.addStretch(1)
+        data = getattr(getattr(self.app, "window", None), "data", {}) or {}
+        self._weather_result(data.get("weather"))
+        return page
+
+    def watch_weather(self, thread):
+        self._watch("weather", thread, self._weather_result)
+
+    def _saved_cities(self):
+        return [item for item in (self.app.cfg.get("weather_saved") or [])
+                if isinstance(item, dict)]
+
+    @staticmethod
+    def _same_place(left, right):
+        try:
+            return (abs(float(left["lat"]) - float(right["lat"])) < 1e-4
+                    and abs(float(left["lon"]) - float(right["lon"])) < 1e-4)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _current_place(self):
+        if self.app.cfg.get("weather_auto"):
+            return None
+        lat = self.app.cfg.get("weather_lat")
+        lon = self.app.cfg.get("weather_lon")
+        if lat is None or lon is None:
+            return None
+        return {"lat": lat, "lon": lon}
+
+    def _rebuild_city_rows(self):
+        while self.city_rows.count():
+            item = self.city_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        current = self._current_place()
+        self.city_rows.addWidget(self._city_row(
+            "自动定位", "按当前网络出口识别城市",
+            bool(self.app.cfg.get("weather_auto")), self._select_auto_city))
+        for place in self._saved_cities():
+            name = str(place.get("name") or "")
+            region = str(place.get("region") or "")
+            title = f"{name} · {region}" if region and region != name else name
+            self.city_rows.addWidget(self._city_row(
+                title or "未命名城市", title,
+                current is not None and self._same_place(current, place),
+                lambda place=place: self._select_city(place),
+                lambda place=place: self._remove_city(place)))
+
+    def _city_row(self, title, tooltip, checked, pick, remove=None):
+        row = QWidget()
+        row.setAutoFillBackground(False)
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        button = QPushButton(title)
+        button.setObjectName("cityRow")
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.setToolTip(tooltip)
+        button.clicked.connect(lambda _checked=False: pick())
+        lay.addWidget(button, 1)
+        if remove is not None:
+            drop = QPushButton("×")
+            drop.setObjectName("cityRemove")
+            drop.setToolTip("删除这个城市")
+            drop.clicked.connect(lambda _checked=False: remove())
+            lay.addWidget(drop)
+        return row
+
+    def _select_auto_city(self):
+        self.app.set_weather_auto()
+        self._set_status(self.weather_status, "已切换自动定位，正在刷新…")
+        self._refresh_weather()
+        self._rebuild_city_rows()
+
+    def _select_city(self, place):
+        name = str(place.get("name") or "").strip()
+        try:
+            lat, lon = float(place["lat"]), float(place["lon"])
+        except (KeyError, TypeError, ValueError):
+            self._set_status(self.weather_status, "城市坐标无效", "error")
+            return
+        self.app.set_weather_city(name, lat, lon)
+        self._set_status(self.weather_status, f"已切换到 {name}，正在刷新…")
+        self._refresh_weather()
+        self._rebuild_city_rows()
+
+    def _remove_city(self, place):
+        saved = [item for item in self._saved_cities()
+                 if not self._same_place(item, place)]
+        self.app.update_config({"weather_saved": saved})
+        current = self._current_place()
+        if current is not None and self._same_place(current, place):
+            self.app.set_weather_auto()
+            self._refresh_weather()
+        self._set_status(self.weather_status, "已删除城市")
+        self._rebuild_city_rows()
+
+    def _queue_city_search(self, _text):
+        if not hasattr(self, "_city_timer"):
+            self._city_timer = QTimer(self)
+            self._city_timer.setSingleShot(True)
+            self._city_timer.timeout.connect(self._search_cities)
+        self._city_timer.start(400)
+
+    def _search_cities(self):
+        text = self.city_search.text().strip()
+        if not text:
+            self.city_results.clear()
+            self.city_result_row.setVisible(False)
+            self.city_add.setEnabled(False)
+            self._set_status(self.city_search_status, "")
+            return
+        self.city_result_row.setVisible(False)
+        self.city_add.setEnabled(False)
+        worker = self._city_search_worker
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+        worker = weather.CitySearch(text, self)
+        worker.found.connect(self._city_found)
+        worker.finished.connect(self._city_search_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._city_search_worker = worker
+        self._set_status(self.city_search_status, "正在搜索城市…")
+        worker.start()
+
+    def _city_search_finished(self):
+        if self._city_search_worker is self.sender():
+            self._city_search_worker = None
+
+    def _city_found(self, query, results):
+        if query != self.city_search.text().strip():
+            return
+        self.city_results.clear()
+        for place in results[:8]:
+            name = str(place.get("name") or "")
+            region = str(place.get("region") or "")
+            label = f"{name} · {region}" if region and region != name else name
+            self.city_results.addItem(label, place)
+        self.city_result_row.setVisible(bool(results))
+        self.city_add.setEnabled(bool(results))
+        self._set_status(
+            self.city_search_status,
+            f"找到 {len(results)} 个城市" if results else "没有匹配的城市",
+            "" if results else "warn")
+
+    def _city_pick_changed(self, _index):
+        self.city_add.setEnabled(
+            isinstance(self.city_results.currentData(), dict))
+
+    def _add_picked_city(self):
+        place = self.city_results.currentData()
+        if not isinstance(place, dict):
+            return
+        name = str(place.get("name") or "")
+        saved = self._saved_cities()
+        if any(self._same_place(item, place) for item in saved):
+            self._set_status(
+                self.city_search_status, "这个城市已经在列表里", "warn")
+            return
+        if len(saved) >= 5:
+            self._set_status(
+                self.city_search_status, "最多保存 5 个城市，先删除一个", "warn")
+            return
+        self.app.update_config({"weather_saved": saved + [place]})
+        self._select_city(place)
+        self.city_search.clear()
+        self.city_results.clear()
+        self.city_result_row.setVisible(False)
+        self.city_add.setEnabled(False)
+        self._set_status(self.city_search_status, f"已添加 {name}", "ok")
+
+    def _refresh_weather(self):
+        thread = self._watched.get("weather")
+        trigger = getattr(thread, "refresh", None)
+        if callable(trigger):
+            trigger()
+            self._set_status(self.weather_state, "正在刷新…")
+        else:
+            self._set_status(self.weather_state, "暂无天气线程", "warn")
+
+    def _weather_result(self, result):
+        result = result or {}
+        temp = result.get("temp")
+        try:
+            temp_text = f"{float(temp):.0f}°"
+        except (TypeError, ValueError):
+            temp_text = "--°"
+        fallback = ("当前位置" if self.app.cfg.get("weather_auto")
+                    else str(self.app.cfg.get("weather_city") or "天气"))
+        place = str(result.get("place") or fallback)
+        region = str(result.get("region") or "")
+        self.weather_place.setText(
+            f"{place} · {region}" if region and region != place else place)
+        self.weather_temp.setText(temp_text)
+        self.weather_text.setText(str(result.get("text") or "尚无天气数据"))
+        error = str(result.get("error") or result.get("cache_error") or "")
+        if error:
+            self._set_status(self.weather_note, f"⚠ {error}", "warn")
+        else:
+            self._set_status(self.weather_note, "")
+        if not result:
+            self._set_status(self.weather_state, "等待刷新")
+        elif result.get("stale"):
+            self._set_status(
+                self.weather_state,
+                "离线 · 上次数据" if temp_text != "--°" else "读取失败",
+                "warn")
+        else:
+            self._set_status(self.weather_state, "已更新", "ok")
+
+    def _save_stock_code(self):
+        code = stock.normalize_code(self.stock_code.text())
+        if not code:
+            self._set_status(
+                self.stock_status, "代码格式无法识别，未保存", "error")
+            return
+        self.stock_code.setText(code)
+        self.app.set_stock_code(code)
+        self._set_status(self.stock_status, f"已保存 {code}", "ok")
 
     def _sync_clock_period(self):
         self.clock_period.setEnabled(bool(self.clock_format.currentData()))
+
+    def _sync_click_through(self, on):
+        """只在穿透开启时警告一次：这时岛点不动，托盘是唯一出口。"""
+        self._set_status(self.click_through_warn,
+                         "岛已不响应点击，请从托盘菜单关闭。" if on else "",
+                         "warn")
 
     def _clock(self, cfg):
         page, outer = self._page()
@@ -489,13 +1073,12 @@ class SettingsDialog(QDialog):
         self.clock_period.currentIndexChanged.connect(
             lambda: self.app.set_option("clock_period",
                                         self.clock_period.currentData()))
+        self.clock_period.setToolTip(
+            "详细时段分：凌晨、上午、中午、下午、傍晚、晚上。\n只在 12 小时制下可选。")
         form.addRow("时间制式", self.clock_format)
         form.addRow("时段文字", self.clock_period)
         self._sync_clock_period()
         display.addLayout(form)
-        display.addWidget(self._hint(
-            "时段文字只在 12 小时制下显示；详细时段：凌晨、上午、中午、"
-            "下午、傍晚、晚上。"))
         self.seconds = Check("显示秒数")
         self.seconds.setChecked(cfg["show_seconds"])
         self.seconds.toggled.connect(
@@ -508,13 +1091,10 @@ class SettingsDialog(QDialog):
         self.english.setChecked(cfg["clock_english"])
         self.english.toggled.connect(
             lambda on: self.app.set_option("clock_english", on))
-        checks = QHBoxLayout()
-        checks.setSpacing(18)
-        checks.addWidget(self.seconds)
-        checks.addWidget(self.weekday)
-        checks.addWidget(self.english)
-        checks.addStretch(1)
-        display.addLayout(checks)
+        self.seconds.setToolTip("更占宽度，收起态可能挤掉其他信息。")
+        self.english.setToolTip("实际显示如 Tue 2:05 PM。")
+        for widget in (self.seconds, self.weekday, self.english):
+            display.addWidget(widget)
 
         habits = self._group(outer, "专注与喝水")
         form = self._form()
@@ -546,14 +1126,9 @@ class SettingsDialog(QDialog):
         self.water_remind.setChecked(cfg.get("water_remind", True))
         self.water_remind.toggled.connect(
             lambda on: self.app.set_option("water_remind", on))
-        row = QHBoxLayout()
-        row.setSpacing(18)
-        row.addWidget(self.focus_remind)
-        row.addWidget(self.water_remind)
-        row.addStretch(1)
-        habits.addLayout(row)
-        habits.addWidget(self._hint(
-            "喝水提醒 9:00–22:00 生效；横幅可稍后确认，收起后仍有角标。"))
+        self.water_remind.setToolTip("9:00–22:00 之间按上面的间隔提醒。")
+        habits.addWidget(self.focus_remind)
+        habits.addWidget(self.water_remind)
         outer.addStretch(1)
         return page
 
@@ -564,21 +1139,30 @@ class SettingsDialog(QDialog):
         form = self._form()
         self.mail_host = QLineEdit(cfg["mail_host"])
         self.mail_host.setPlaceholderText("如 imap.qq.com")
+        self.mail_host.setToolTip("QQ 用 imap.qq.com，163 用 imap.163.com。")
         self.mail_port = Spin()
         self.mail_port.setRange(1, 65535)
         self.mail_port.setValue(cfg["mail_port"])
+        self.mail_port.setToolTip("SSL 常用 993，明文常用 143。")
         self.mail_user = QLineEdit(cfg["mail_user"])
+        self.mail_user.setPlaceholderText("完整邮箱地址，如 me@qq.com")
         self.mail_password = QLineEdit()
         self.mail_password.setEchoMode(QLineEdit.Password)
         if cfg["mail_password"]:
             self.mail_password.setPlaceholderText("已保存，留空不修改")
+        else:
+            self.mail_password.setPlaceholderText("邮箱授权码，不是登录密码")
+        self.mail_password.setToolTip(
+            "QQ/163 填授权码。也可用环境变量 UKUI_ISLAND_MAIL_PASSWORD "
+            "覆盖已保存的密码。")
         form.addRow("服务器", self.mail_host)
         form.addRow("端口", self.mail_port)
         form.addRow("账号", self.mail_user)
         form.addRow("密码", self.mail_password)
         connection.addLayout(form)
-        self.mail_tls = Check("SSL（993）；取消则用明文 IMAP")
+        self.mail_tls = Check("用 SSL 加密")
         self.mail_tls.setChecked(cfg["mail_tls"])
+        self.mail_tls.setToolTip("取消则用明文 IMAP，密码会明文发送。")
         connection.addWidget(self.mail_tls)
 
         behaviour = self._group(outer, "提醒与同步")
@@ -590,6 +1174,7 @@ class SettingsDialog(QDialog):
         self.mail_sync.setChecked(cfg.get("mail_sync_operations", False))
         self.mail_sync.toggled.connect(
             lambda on: self.app.set_option("mail_sync_operations", on))
+        self.mail_sync.setToolTip("开启后删除会移到邮箱回收站。")
         behaviour.addWidget(self.mail_remind)
         behaviour.addWidget(self.mail_sync)
 
@@ -602,10 +1187,6 @@ class SettingsDialog(QDialog):
         outer.addLayout(actions)
         self.mail_status = self._status("")
         outer.addWidget(self.mail_status)
-        outer.addWidget(self._hint(
-            "QQ/163 服务器：imap.qq.com / imap.163.com。密码填邮箱授权码，"
-            "不是登录密码；已保存的密码留空不修改。默认只读，同步删除会移到"
-            "回收站。也可用 UKUI_ISLAND_MAIL_PASSWORD 覆盖密码。"))
         outer.addStretch(1)
         return page
 
@@ -648,10 +1229,13 @@ class SettingsDialog(QDialog):
         self.calendar_url.setPlaceholderText(
             ".ics 路径 / https:// 地址 / CalDAV")
         self.calendar_user = QLineEdit(cfg["calendar_user"])
+        self.calendar_user.setPlaceholderText("CalDAV 账号，本地 .ics 留空")
         self.calendar_password = QLineEdit()
         self.calendar_password.setEchoMode(QLineEdit.Password)
         if cfg["calendar_password"]:
             self.calendar_password.setPlaceholderText("已保存，留空不修改")
+        else:
+            self.calendar_password.setPlaceholderText("CalDAV 密码，本地 .ics 留空")
         form.addRow("地址", self.calendar_url)
         form.addRow("账号", self.calendar_user)
         form.addRow("密码", self.calendar_password)
@@ -666,9 +1250,7 @@ class SettingsDialog(QDialog):
         outer.addLayout(actions)
         self.calendar_status = self._status("")
         outer.addWidget(self.calendar_status)
-        outer.addWidget(self._hint(
-            "支持本地 .ics、普通 ICS 链接和 CalDAV。重复日程（RRULE）"
-            "只显示首次出现。"))
+        self.calendar_url.setToolTip("重复日程（RRULE）只显示首次出现。")
         outer.addStretch(1)
         return page
 
@@ -712,68 +1294,107 @@ class SettingsDialog(QDialog):
 
     def _quota(self, cfg):
         page, outer = self._page()
+        self._quota_cards = {}
+        reading = getattr(self.app, "quota_thread", None) is not None
+        self._quota_reading = reading
 
-        source = self._group(outer, "额度来源")
-        form = self._form()
-        self.quota_url = QLineEdit(cfg["quota_url"])
-        self.quota_url.setPlaceholderText(
-            "New API / One API / Sub2API 或任意 JSON 额度地址（可选）")
-        self.quota_token = QLineEdit(cfg.get("quota_token", ""))
-        self.quota_token.setEchoMode(QLineEdit.Password)
-        self.quota_token.setPlaceholderText("Bearer token（可选）")
-        form.addRow("中转/自定义 JSON", self.quota_url)
-        form.addRow("中转 Token", self.quota_token)
-        source.addLayout(form)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        refresh = QPushButton("刷新额度")
+        refresh.clicked.connect(self._refresh_quota)
+        bar.addWidget(refresh)
+        bar.addStretch(1)
+        outer.addLayout(bar)
+        self.quota_status = self._status("正在读取本机额度…" if reading else "")
+        outer.addWidget(self.quota_status)
 
-        online = self._group(outer, "在线查询")
-        self.codex_online = Check("Codex 用本机登录令牌向官方查询额度")
+        sources = self._group(outer, "账号与来源")
+        lay = self._quota_card(
+            sources, "codex", "Codex",
+            "本机用量与配额快照；开启后向官方查询最新周期。")
+        self.codex_online = Check("同时向官方查询")
         self.codex_online.setChecked(bool(cfg.get("codex_online")))
-        self.claude_online = Check("Claude 用本机登录令牌向官方查询额度")
+        lay.addWidget(self.codex_online)
+
+        lay = self._quota_card(
+            sources, "claude", "Claude",
+            "只读桌面版本地用量记录；开启后向官方查询周期。")
+        self.claude_online = Check("向官方查询")
         self.claude_online.setChecked(bool(cfg.get("claude_online")))
-        self.workbuddy_online = Check("WorkBuddy 用官网账号查询积分")
+        lay.addWidget(self.claude_online)
+
+        lay = self._quota_card(
+            sources, "workbuddy", "WorkBuddy",
+            "本机 trace 统计；登录官网后可读取剩余积分。")
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.workbuddy_online = Check("读取官网积分")
         self.workbuddy_online.setChecked(bool(cfg.get("workbuddy_online")))
-        self.trae_online = Check("Trae CN 用本机登录令牌查询官方额度")
-        self.trae_online.setChecked(bool(cfg.get("trae_online")))
-        self.copilot_online = Check("Copilot 用编辑器或 CLI 的登录查询额度")
-        self.copilot_online.setChecked(bool(cfg.get("copilot_online")))
-        self.copilot_connect = QPushButton("连接 Copilot")
-        self.copilot_connect.clicked.connect(self._connect_copilot)
-        self.copilot_status = self._status(
-            "已连接 Copilot 账号" if quota.copilot_session()
-            else "未连接：可点“连接 Copilot”走 GitHub 设备码登录")
-        self.trae_connect = QPushButton("连接 Trae CN")
-        self.trae_connect.clicked.connect(self._connect_trae)
-        self.trae_status = self._status(
-            "已连接 Trae CN 账号" if quota.trae_session()
-            else "未连接：点“连接 Trae CN”打开浏览器登录")
+        row.addWidget(self.workbuddy_online)
+        row.addStretch(1)
         self.workbuddy_connect = QPushButton("连接 WorkBuddy")
         self.workbuddy_connect.clicked.connect(self._connect_workbuddy)
+        row.addWidget(self.workbuddy_connect)
+        lay.addLayout(row)
         self.workbuddy_status = self._status(
             "已连接 WorkBuddy 账号" if quota.workbuddy_session()
             else "未连接：点“连接 WorkBuddy”打开浏览器登录")
-        online.addWidget(self.codex_online)
-        online.addWidget(self.claude_online)
+        lay.addWidget(self.workbuddy_status)
+
+        lay = self._quota_card(
+            sources, "trae", "Trae CN",
+            "用本机登录令牌查询官方额度。")
         row = QHBoxLayout()
-        row.setSpacing(12)
-        row.addWidget(self.workbuddy_online)
-        row.addStretch(1)
-        row.addWidget(self.workbuddy_connect)
-        online.addLayout(row)
-        row = QHBoxLayout()
-        row.setSpacing(12)
+        row.setSpacing(10)
+        self.trae_online = Check("读取官方额度")
+        self.trae_online.setChecked(bool(cfg.get("trae_online")))
         row.addWidget(self.trae_online)
         row.addStretch(1)
+        self.trae_connect = QPushButton("连接 Trae CN")
+        self.trae_connect.clicked.connect(self._connect_trae)
         row.addWidget(self.trae_connect)
-        online.addLayout(row)
+        lay.addLayout(row)
+        self.trae_status = self._status(
+            "已连接 Trae CN 账号" if quota.trae_session()
+            else "未连接：点“连接 Trae CN”打开浏览器登录")
+        lay.addWidget(self.trae_status)
+
+        lay = self._quota_card(
+            sources, "copilot", "Copilot",
+            "读取 VS Code、Copilot CLI 或 gh 已有的登录。")
         row = QHBoxLayout()
-        row.setSpacing(12)
+        row.setSpacing(10)
+        self.copilot_online = Check("读取官方额度")
+        self.copilot_online.setChecked(bool(cfg.get("copilot_online")))
         row.addWidget(self.copilot_online)
         row.addStretch(1)
+        self.copilot_connect = QPushButton("连接 Copilot")
+        self.copilot_connect.clicked.connect(self._connect_copilot)
         row.addWidget(self.copilot_connect)
-        online.addLayout(row)
-        online.addWidget(self.workbuddy_status)
-        online.addWidget(self.trae_status)
-        online.addWidget(self.copilot_status)
+        lay.addLayout(row)
+        self.copilot_status = self._status(
+            "已连接 Copilot 账号" if quota.copilot_session()
+            else "未连接：可点“连接 Copilot”走 GitHub 设备码登录")
+        lay.addWidget(self.copilot_status)
+
+        lay = self._quota_card(
+            sources, "remote", "中转 / 自定义 JSON",
+            "New API、One API、Sub2API 或任意返回额度的 JSON 地址。")
+        form = self._form()
+        self.quota_url = QLineEdit(cfg["quota_url"])
+        self.quota_url.setPlaceholderText("https://你的站点地址（可含子目录）")
+        self.quota_token = QLineEdit(cfg.get("quota_token", ""))
+        self.quota_token.setEchoMode(QLineEdit.Password)
+        self.quota_token.setPlaceholderText("Bearer token（可选）")
+        form.addRow("地址", self.quota_url)
+        form.addRow("Token", self.quota_token)
+        lay.addLayout(form)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        remove = QPushButton("移除")
+        remove.clicked.connect(self._remove_quota_remote)
+        row.addWidget(remove)
+        lay.addLayout(row)
 
         save = QPushButton("保存并刷新")
         save.setObjectName("primary")
@@ -782,14 +1403,50 @@ class SettingsDialog(QDialog):
         actions.addStretch(1)
         actions.addWidget(save)
         outer.addLayout(actions)
-        self.quota_status = self._status("")
-        outer.addWidget(self.quota_status)
         outer.addWidget(self._hint(
-            "默认只读本机记录，失败自动回退。在线查询只把登录令牌发给对应"
-            "官方接口，不写日志。Trae CN 与 WorkBuddy 积分需先在官网完成一次"
-            "浏览器登录；Copilot 读取 VS Code、Copilot CLI 或 gh 已有的登录。"))
+            "在线查询只把登录令牌发给对应官方接口，不写日志。"))
         outer.addStretch(1)
         return page
+
+    def _quota_card(self, outer, key, title, subtitle):
+        card = QFrame()
+        card.setObjectName("card")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        name = QLabel(title)
+        name.setObjectName("cardTitle")
+        state = QLabel("读取中…" if getattr(self, "_quota_reading", False)
+                       else "等待刷新")
+        state.setObjectName("cardState")
+        head.addWidget(name)
+        head.addStretch(1)
+        head.addWidget(state)
+        lay.addLayout(head)
+        hint = QLabel(subtitle)
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        outer.addWidget(card)
+        self._quota_cards[key] = state
+        return lay
+
+    def _refresh_quota(self):
+        thread = self._watched.get("quota")
+        trigger = getattr(thread, "refresh", None)
+        if callable(trigger):
+            trigger()
+            self._set_status(self.quota_status, "正在刷新额度…")
+        else:
+            self._set_status(self.quota_status, "暂无额度线程", "warn")
+
+    def _remove_quota_remote(self):
+        self.quota_url.clear()
+        self.quota_token.clear()
+        self.app.update_config({"quota_url": "", "quota_token": ""})
+        self._set_status(self.quota_status, "已移除中转来源", "ok")
 
     def _save_quota(self):
         self._set_status(self.quota_status, "已保存，正在刷新…")
@@ -810,6 +1467,7 @@ class SettingsDialog(QDialog):
         result = result or {}
         providers = result.get("providers") or []
         at = result.get("at") or ""
+        self._show_quota(providers)
         ready = [item for item in providers if item.get("status") == "ok"]
         failed = [item for item in providers if item.get("status") == "error"]
         if failed:
@@ -826,6 +1484,38 @@ class SettingsDialog(QDialog):
         else:
             self._set_status(
                 self.quota_status, "刷新完成，没有可用的额度来源", "warn")
+
+    def _show_quota(self, providers):
+        labels = {"Codex": "codex", "Claude": "claude",
+                  "WorkBuddy": "workbuddy", "Trae CN": "trae",
+                  "Copilot": "copilot", "中转": "remote"}
+        seen = {}
+        for item in providers:
+            key = str(item.get("id") or "").lower()
+            key = key or labels.get(str(item.get("label") or ""), "")
+            if key:
+                seen[key] = item
+        for key, state in self._quota_cards.items():
+            item = seen.get(key)
+            if item is None:
+                self._set_status(
+                    state, "未配置" if key == "remote" else "未开启")
+                continue
+            if item.get("status") == "error":
+                self._set_status(
+                    state, self._short(
+                        f"读取失败：{item.get('error') or '未知错误'}"),
+                    "error")
+                continue
+            parts = [f"{metric.get('label')} {metric.get('text')}"
+                     for metric in (item.get("metrics") or [])[:2]
+                     if isinstance(metric, dict)]
+            self._set_status(
+                state, self._short(" · ".join(parts) or "已连接"), "ok")
+
+    @staticmethod
+    def _short(text, limit=30):
+        return text if len(text) <= limit else text[:limit - 1] + "…"
 
     def _connect_workbuddy(self):
         if (self._workbuddy_login is not None
@@ -910,6 +1600,7 @@ class SettingsDialog(QDialog):
         else:
             self._set_status(
                 self.trae_status, f"已连接 {plan} · 剩余 {text}", "ok")
+        self.app.update_config({"trae_online": True})
 
     def _trae_failed(self, message):
         self._set_status(self.trae_status, str(message), "error")
@@ -951,6 +1642,7 @@ class SettingsDialog(QDialog):
         else:
             self._set_status(
                 self.copilot_status, f"已连接 {plan} · 剩余 {text}", "ok")
+        self.app.update_config({"copilot_online": True})
 
     def _copilot_failed(self, message):
         self._set_status(self.copilot_status, str(message), "error")
@@ -967,6 +1659,9 @@ class SettingsDialog(QDialog):
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
         worker = self._copilot_login
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+        worker = self._city_search_worker
         if worker is not None and worker.isRunning():
             worker.requestInterruption()
         super().done(result)

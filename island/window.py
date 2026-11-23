@@ -14,7 +14,8 @@ from PySide2.QtGui import (QColor, QDrag, QFont, QCursor, QGuiApplication,
                            QPixmap)
 from PySide2.QtWidgets import QFileDialog, QLineEdit, QWidget
 
-from island import blur, geometry, lyrics, mail, render, weather, x11
+from island import (blur, geometry, lyrics, mail, meeting, render, stock as
+                    stock_module, weather, x11)
 from island.mail_reader import MailReader
 from island.motion import Spring
 from island.music import format_time
@@ -32,15 +33,17 @@ SWELL_W, SWELL_H = 1.075, 1.13
 LYRIC_FADE = 0.18
 NOTICE_FADE = 0.16
 NOTICE_SECONDS = 8.0
+MEETING_OFFER_SECONDS = 60.0
 WATER_HOURS = (9, 22)
 MAIL_NEW_SECONDS = 600.0
 WEEKDAYS_ZH = "一二三四五六日"
 WEEKDAYS_EN = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MONTHS_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-PAGES = (("music", "音乐"), ("focus", "专注"), ("water", "健康"),
-         ("tools", "置物架"), ("todo", "待办"), ("mail", "邮箱"),
-         ("quota", "AI 额度"), ("calendar", "日程"), ("monitor", "监控"))
+PAGES = (("music", "音乐"), ("weather", "天气"), ("focus", "专注"),
+         ("water", "健康"), ("tools", "置物架"), ("todo", "待办"),
+         ("mail", "邮箱"), ("quota", "AI 额度"), ("stock", "股票"),
+         ("calendar", "日程"), ("monitor", "监控"))
 TOOLS = (("shelf", "置物"), ("clips", "剪贴"), ("notify", "通知"))
 PAGE_TITLE = {
     "music": "音乐",
@@ -50,6 +53,8 @@ PAGE_TITLE = {
     "todo": "待办",
     "mail": "邮箱",
     "quota": "额度",
+    "stock": "股票",
+    "weather": "天气",
     "calendar": "日程",
     "monitor": "监控",
 }
@@ -85,11 +90,20 @@ def _cover_colors(title):
     return palette[digest % len(palette)]
 
 
+def _meter_token(value):
+    if value is None:
+        return "textTertiary"
+    if value >= 0.92:
+        return "danger"
+    return "warning" if value >= 0.8 else "textPrimary"
+
+
 class IslandWindow(QWidget):
     music_command = Signal(str)
     music_seek = Signal(float)
     open_settings = Signal(str)
     option_change = Signal(str, object)
+    monitor_focus = Signal(bool)
     mail_action = Signal(str, object)
 
     def __init__(self, cfg, theme):
@@ -119,9 +133,13 @@ class IslandWindow(QWidget):
         self.quota = {"providers": [], "at": ""}
         self.quota_selected = ""
         self.quota_refresh = None
+        self.stock = {"status": "loading", "code": self.cfg.get("stock_code", ""),
+                      "points": []}
+        self.stock_refresh = None
         self.activity = {"provider": "", "state": "idle", "label": "",
                          "detail": "", "active": False, "at": 0.0}
         self._activity_shown = False
+        self._stock_shown = True
         self.notifications = []
         self._unread = 0
         self.notify_error = ""
@@ -138,10 +156,13 @@ class IslandWindow(QWidget):
         self._mail_refresh_until = 0.0
         self._calendar_refresh_until = 0.0
         self._quota_refresh_until = 0.0
+        self._stock_refresh_until = 0.0
         self._last_mail_unread = 0
         self._mail_detail = None
         self._scroll = {"mail": 0, "clips": 0, "todo": 0}
         self._confirm = ("", 0.0)
+        self._meeting_offer = None
+        self._todo_detail = None
         self._copied_text = ""
         self._copy_until = 0.0
         self._pet_until = 0.0
@@ -183,6 +204,7 @@ class IslandWindow(QWidget):
         self._mail_op_until = 0.0
         self._mail_op_token = "textTertiary"
         self._mail_op_action = ""
+        self._mail_op_key = None
         self._mail_pending_delete = ""
         self._marquee = {}
         self._drag_seek = None
@@ -431,12 +453,17 @@ class IslandWindow(QWidget):
         gap = 6 * scale
         clock_w = render.text_width(self._clock_text(datetime.now()),
                                     13.5 * scale, QFont.DemiBold)
-        level = self.data.get("battery")
+        level = self._battery_level()
         battery_w = 0.0
         if level is not None:
-            battery_w = (22 * scale + 2 * scale + render.text_width(
-                f"{int(level * 100)}%", 9 * scale, QFont.DemiBold))
+            battery_w = render.BATTERY_W * scale
         return 8 * scale + clock_w + (gap + battery_w if battery_w else 0.0)
+
+    def _battery_level(self):
+        """None when the machine has no battery or the user hid the gauge."""
+        if not self.cfg.get("show_battery", True):
+            return None
+        return self.data.get("battery")
 
     def _compact_capacity(self, scale):
         screen = self._screen()
@@ -473,6 +500,12 @@ class IslandWindow(QWidget):
                           "mail"))
         if self._water_pending:
             parts.append(("water", 48 * scale, "water"))
+        if self._meeting_offer is not None:
+            parts.append(("meeting", 60 * scale, "todo"))
+        if self.cfg.get("show_stock", True) and self._stock_shown:
+            label = self._stock_chip_text()
+            parts.append(("stock", 8 * scale + render.text_width(
+                label, 9.5 * scale, QFont.DemiBold), "stock"))
         slot = self._weather_slot(scale)
         if slot:
             parts.append(("weather", slot["width"], None))
@@ -496,7 +529,7 @@ class IslandWindow(QWidget):
 
     def _notice_text(self, notice):
         body = str(notice.get("body") or "")
-        if notice.get("kind") == "mail" and body:
+        if notice.get("kind") in ("mail", "meeting") and body:
             return f"{notice.get('title', '')} · {body}"
         return str(notice.get("title") or "")
 
@@ -581,6 +614,30 @@ class IslandWindow(QWidget):
         if unread <= 0:
             return ""
         return "99+" if unread > 99 else str(unread)
+
+    def _stock_change_pct(self):
+        try:
+            return float(self.stock.get("change_pct"))
+        except (TypeError, ValueError):
+            return None
+
+    def _stock_chip_visible(self):
+        """收盘/休市一段时间后收起态不再显示涨跌。"""
+        return stock_module.chip_visible(
+            self.stock.get("code") or self.cfg.get("stock_code", ""),
+            self.stock.get("date", ""), None,
+            int(self.cfg.get("stock_grace_minutes", 15)),
+            bool(self.cfg.get("stock_hide_closed", True)))
+
+    def _stock_chip_text(self):
+        pct = self._stock_change_pct()
+        return "--" if pct is None else f"{pct:+.2f}%"
+
+    def _stock_token(self):
+        pct = self._stock_change_pct()
+        if pct is None or abs(pct) < 0.005:
+            return "textTertiary" if pct is None else "textPrimary"
+        return "danger" if pct > 0 else "success"
 
     def _weather_slot(self, scale):
         if not self.cfg.get("show_weather", True):
@@ -712,6 +769,11 @@ class IslandWindow(QWidget):
             index = self._mail_index(notice["key"])
             if index is not None:
                 self._mail_detail = index
+        if page == "todo" and notice.get("key") is not None:
+            for index, item in enumerate(self.productivity.todos):
+                if item is notice["key"] and self._todo_details(item):
+                    self._todo_detail = index
+                    break
         self.set_expanded(True, animate=False)
 
     def _ack_water(self, drink):
@@ -728,6 +790,37 @@ class IslandWindow(QWidget):
                         if alert.get("kind") != kind]
         if self._notice is not None and self._notice.get("kind") == kind:
             self._show_next_notice(force=True)
+
+    def offer_meeting(self, text):
+        """Ask before turning a copied meeting invite into a todo."""
+        if not self.cfg.get("meeting_detect", True):
+            return False
+        offer = meeting.parse_meeting(text)
+        if not offer:
+            return False
+        if self._meeting_offer and self._meeting_offer["text"] == offer["text"]:
+            return False
+        self._meeting_offer = dict(offer, until=time.monotonic()
+                                   + MEETING_OFFER_SECONDS)
+        banner = (self.expanded and self.page == "todo"
+                  and not (self._todo_adding or self._todo_editing is not None))
+        if not banner:
+            self._enqueue_alert("meeting", "会议邀请", offer["title"],
+                                "todo")
+        self._apply_geometry(animate=True)
+        self.update()
+        return True
+
+    def _resolve_meeting(self, accept):
+        offer = self._meeting_offer or {}
+        self._meeting_offer = None
+        if accept and self.productivity.add_todo(
+                offer.get("text"), None, offer.get("remind", ""),
+                offer.get("remind_on", ""), offer):
+            self._scroll["todo"] = 0
+            self._pet_until = time.monotonic() + 2.0
+        self._drop_alert("meeting")
+        self._apply_geometry(animate=True)
 
     def _water_tick(self):
         now = datetime.now()
@@ -765,7 +858,8 @@ class IslandWindow(QWidget):
             if key in self._todo_reminded:
                 continue
             self._todo_reminded[key] = True
-            self._enqueue_alert("todo", "待办到时间了", item["text"], "todo")
+            self._enqueue_alert("todo", "待办到时间了", item["text"], "todo",
+                                key=item)
 
     def _mail_key(self, item):
         return (item.get("sender", ""), item.get("subject", ""),
@@ -781,6 +875,10 @@ class IslandWindow(QWidget):
         return None
 
     def _mail_unread(self, item):
+        if (self._mail_op_key == self._mail_key(item)
+                and time.monotonic() < self._mail_op_until):
+            # 服务器操作还在路上：先按用户点的意思显示，刷新回来以服务器为准
+            return self._mail_op_action == "unseen"
         return (not item.get("seen", False)
                 and self._mail_key(item) not in self._mail_read)
 
@@ -822,7 +920,7 @@ class IslandWindow(QWidget):
 
     def _todo_card_rect(self):
         area = self._content_rect()
-        return QRectF(area.left() + 154, area.top(), area.width() - 154,
+        return QRectF(area.left() + 84, area.top(), area.width() - 84,
                       area.height())
 
     def _todo_time_rect(self):
@@ -894,6 +992,7 @@ class IslandWindow(QWidget):
             self._page_dir = 1 if names.index(page) > old else -1
             self._page_beat.start()
         self.page = page
+        self._sync_monitor_sampling()
         if page != "todo":
             self._todo_adding = False
             self._todo_editing = None
@@ -903,12 +1002,22 @@ class IslandWindow(QWidget):
             self.todo_time_input.clear()
         if page != "mail":
             self._mail_detail = None
+        if page != "todo":
+            self._todo_detail = None
         if page != "music":
             self._volume_open = False
         self._page_at = time.monotonic()
         self._confirm = ("", 0.0)
-        if page == "tools" and self.tools_page == "notify":
-            self._unread = 0
+        if page == "tools":
+            if self._unread:
+                # 页码豆亮只可能是新通知，直接落到通知，省得挨个标签找
+                self.tools_page = "notify"
+            if self.tools_page == "notify":
+                self._unread = 0
+            elif (self.tools_page == "shelf" and not self.productivity.shelf
+                    and self.productivity.clips):
+                # 空置物架没东西可看，优先落到剪贴；两边都空时留在置物架看拖拽提示
+                self.tools_page = "clips"
         self._sync_overlays()
         self.update()
 
@@ -930,9 +1039,20 @@ class IslandWindow(QWidget):
         self.set_page(names[index])
 
     def _pages(self):
-        if self.cfg.get("show_monitor", True):
-            return PAGES
-        return tuple(item for item in PAGES if item[0] != "monitor")
+        return PAGES
+
+    def _sync_monitor_sampling(self):
+        self.monitor_focus.emit(bool(self.cfg.get("show_monitor", True))
+                                or self._status_strip())
+
+    def _status_strip(self):
+        """Views that draw resource readings regardless of the pill toggle."""
+        if not self.expanded:
+            return False
+        if self.page == "monitor":
+            return True
+        return self.page == "music" and not (
+            self.music and self.music.get("title"))
 
     def set_mail(self, result):
         self._mail_refresh_until = 0.0
@@ -987,9 +1107,25 @@ class IslandWindow(QWidget):
                     self._mail_hidden.add(self._mail_pending_delete)
                     self._mail_pending_delete = ""
                 self._mail_detail = None
+            elif self._mail_op_key:
+                # 服务器已确认：直接落到缓存上，等刷新回来前不会闪回旧状态
+                for item in self.mail.get("items") or []:
+                    if self._mail_key(item) == self._mail_op_key:
+                        item["seen"] = self._mail_op_action == "seen"
+                        if item["seen"]:
+                            self._mail_mark_read(item)
+                        else:
+                            self._mail_read.discard(self._mail_key(item))
             QTimer.singleShot(400, lambda: self._do_action("mail_refresh"))
         elif self._mail_op_action in ("seen", "unseen"):
-            self._mail_detail = None
+            # 服务器没接受：把本地状态改回真实的样子，留在详情页好重试
+            key = self._mail_op_key
+            if key:
+                if self._mail_op_action == "seen":
+                    self._mail_read.discard(key)
+                else:
+                    self._mail_read.add(key)
+        self._mail_op_key = None
         self.update()
 
     def set_calendar(self, result):
@@ -1006,6 +1142,16 @@ class IslandWindow(QWidget):
         self._quota_refresh_until = 0.0
         self.update()
 
+    def set_stock(self, result):
+        code = (result or {}).get("code")
+        if code and code != self.cfg.get("stock_code"):
+            return
+        self.stock = dict(result or {})
+        self._stock_refresh_until = 0.0
+        self._stock_shown = self._stock_chip_visible()
+        self._apply_geometry(animate=True)
+        self.update()
+
     def set_activity(self, result):
         state = dict(result or {})
         keys = ("provider", "state", "label", "detail", "active", "at")
@@ -1016,7 +1162,14 @@ class IslandWindow(QWidget):
         self._apply_geometry(animate=True)
         self.update()
 
+    def clear_activity(self):
+        """Turn off the feature: drop the last known turn state."""
+        self.set_activity({"provider": "", "state": "idle", "label": "",
+                           "detail": "", "active": False, "at": 0.0})
+
     def _activity_visible(self):
+        if not self.cfg.get("show_activity", True):
+            return False
         state = self.activity.get("state")
         if state in ("thinking", "working", "responding"):
             return bool(self.activity.get("active"))
@@ -1073,6 +1226,10 @@ class IslandWindow(QWidget):
 
     def _watch_desktop(self):
         shown = x11.showing_desktop()
+        if not shown and not self._fs_hidden and self.isMinimized():
+            # 显示桌面会把岛一起最小化，退出后 WM 不一定帮我们恢复
+            self.showNormal()
+            x11.remap(int(self.winId()))
         if shown == self._desktop_shown:
             return
         self._desktop_shown = shown
@@ -1117,21 +1274,25 @@ class IslandWindow(QWidget):
     def apply(self, cfg, theme):
         self.cfg = cfg
         self.theme = theme
-        if not self.cfg.get("show_monitor", True):
-            for key in ("memory", "cpu", "disk", "temperature", "gpu",
-                        "net_down", "net_up", "online"):
-                self.data[key] = None
         if self.page not in dict(self._pages()):
             self.set_page("music")
+        self._sync_monitor_sampling()
+        if self.stock.get("code") != self.cfg.get("stock_code"):
+            self.stock = {"status": "loading", "points": [],
+                          "code": self.cfg.get("stock_code", "")}
         if not self.focus["running"]:
             self._focus_reset()
+        self._stock_shown = self._stock_chip_visible()
         interval = self._water_interval()
         if interval != self._water_minutes_seen:
             self._water_minutes_seen = interval
             self._water_due = time.monotonic() + interval
         disabled = [kind for kind, key in (
-            ("water", "water_remind"), ("focus", "focus_remind"),
+            ("meeting", "meeting_detect"), ("water", "water_remind"),
+            ("focus", "focus_remind"),
             ("mail", "mail_remind")) if not self.cfg.get(key, True)]
+        if "meeting" in disabled:
+            self._meeting_offer = None
         if "water" in disabled:
             self._water_pending = False
         if disabled:
@@ -1139,6 +1300,7 @@ class IslandWindow(QWidget):
                             if alert.get("kind") not in disabled]
             if self._notice is not None and self._notice.get("kind") in disabled:
                 self._show_next_notice(force=True)
+        self._activity_shown = self._activity_visible()
         self._apply_geometry()
         QTimer.singleShot(50, self._apply_blur)
 
@@ -1157,11 +1319,14 @@ class IslandWindow(QWidget):
         self.update()
 
     def set_music(self, music):
+        had_track = bool(self.music and self.music.get("title"))
         if music and not music.get("title"):
             music = None
         if music is None or music.get("title") != self._seek_title:
             self._seek_preview = None
         self.music = music
+        if had_track != bool(music and music.get("title")):
+            self._sync_monitor_sampling()
         if music:
             path = music.get("art_path", "")
             if path != self._cover_path:
@@ -1187,6 +1352,10 @@ class IslandWindow(QWidget):
         if visible != self._activity_shown:
             self._activity_shown = visible
             self._apply_geometry(animate=True)
+        shown = self._stock_chip_visible()
+        if shown != self._stock_shown:
+            self._stock_shown = shown
+            self._apply_geometry(animate=True)
         if self.focus["running"] and self.focus["remaining"] > 0:
             self.focus["remaining"] = max(0, self.focus["remaining"] - 1)
             if self.focus["remaining"] == 0:
@@ -1208,6 +1377,10 @@ class IslandWindow(QWidget):
                 self._apply_geometry(animate=True)
         self._water_tick()
         self._todo_reminder_tick()
+        if (self._meeting_offer is not None
+                and time.monotonic() >= self._meeting_offer["until"]):
+            self._meeting_offer = None
+            self._drop_alert("meeting")
         if (self._notice is not None
                 and time.monotonic() >= self._notice_until):
             self._show_next_notice(force=True)
@@ -1276,6 +1449,7 @@ class IslandWindow(QWidget):
                 self._start_motion()
             return
         self.expanded = expanded
+        self._sync_monitor_sampling()
         if not expanded:
             self._todo_adding = False
             self._todo_editing = None
@@ -1329,7 +1503,7 @@ class IslandWindow(QWidget):
 
     def _volume_popup_rect(self):
         area = self._content_rect()
-        return QRectF(area.right() - 68, area.top() + 4, 64, 66)
+        return QRectF(area.right() - 64, area.top() + 4, 64, 66)
 
     def _volume_track_rect(self):
         popup = self._volume_popup_rect()
@@ -1372,6 +1546,9 @@ class IslandWindow(QWidget):
                             self._do_action(action, arg)
                             return
                     return
+                self._volume_open = False
+                self.update()
+                return
             for rect, action, arg in reversed(self._tab_hits + self._tools_hits
                                               + self._hits):
                 if rect.contains(point):
@@ -1565,6 +1742,7 @@ class IslandWindow(QWidget):
     def _refreshing(self, kind):
         until = (self._mail_refresh_until if kind == "mail"
                  else self._quota_refresh_until if kind == "quota"
+                else self._stock_refresh_until if kind == "stock"
                  else self._calendar_refresh_until)
         return time.monotonic() < until
 
@@ -1631,6 +1809,12 @@ class IslandWindow(QWidget):
             self.update()
         elif action == "todo_save":
             self._todo_submit()
+        elif action == "todo_detail":
+            self._todo_detail = int(arg)
+            self.update()
+        elif action == "todo_back":
+            self._todo_detail = None
+            self.update()
         elif action == "todo_repeat":
             day = int(arg)
             if day in self._todo_repeat:
@@ -1643,11 +1827,17 @@ class IslandWindow(QWidget):
             self._apply_geometry(animate=True)
         elif action == "todo_remove":
             self.productivity.remove_todo(int(arg))
+            self._todo_detail = None
             self._apply_geometry(animate=True)
         elif action == "todo_clear":
             if self._arm_confirm("todo_clear"):
                 self.productivity.clear_done_todos()
+                self._todo_detail = None
                 self._apply_geometry(animate=True)
+        elif action == "meeting_accept":
+            self._resolve_meeting(True)
+        elif action == "meeting_reject":
+            self._resolve_meeting(False)
         elif action == "water":
             amount = int(arg)
             if self.productivity.add_water(amount):
@@ -1700,6 +1890,7 @@ class IslandWindow(QWidget):
                 if (self._mail_sync_enabled() and item.get("uid")
                         and not item.get("seen", False)):
                     self._mail_op_action = "seen"
+                    self._mail_op_key = self._mail_key(item)
                     self._mail_op_message = "正在同步已读…"
                     self._mail_op_until = time.monotonic() + 15.0
                     self._mail_op_token = "textTertiary"
@@ -1720,6 +1911,7 @@ class IslandWindow(QWidget):
                 self._mail_mark_read(item)
                 if self._mail_sync_enabled() and item.get("uid"):
                     self._mail_op_action = "seen"
+                    self._mail_op_key = self._mail_key(item)
                     self._mail_op_message = "正在同步已读…"
                     self._mail_op_until = time.monotonic() + 15.0
                     self._mail_op_token = "textTertiary"
@@ -1730,6 +1922,7 @@ class IslandWindow(QWidget):
             if item and self._mail_sync_enabled() and item.get("uid"):
                 self._mail_read.discard(self._mail_key(item))
                 self._mail_op_action = "unseen"
+                self._mail_op_key = self._mail_key(item)
                 self._mail_op_message = "正在同步未读…"
                 self._mail_op_until = time.monotonic() + 15.0
                 self._mail_op_token = "textTertiary"
@@ -1743,6 +1936,7 @@ class IslandWindow(QWidget):
                 self._mail_mark_read(item)
             if self._mail_sync_enabled():
                 self._mail_op_action = "all_seen"
+                self._mail_op_key = None
                 self._mail_op_message = "正在同步全部已读…"
                 self._mail_op_until = time.monotonic() + 15.0
                 self._mail_op_token = "textTertiary"
@@ -1780,6 +1974,12 @@ class IslandWindow(QWidget):
                 self._quota_refresh_until = time.monotonic() + 15.0
                 if callable(self.quota_refresh):
                     self.quota_refresh()
+                self.update()
+        elif action == "stock_refresh":
+            if not self._refreshing("stock"):
+                self._stock_refresh_until = time.monotonic() + 15.0
+                if callable(self.stock_refresh):
+                    self.stock_refresh()
                 self.update()
         elif action == "quota_pick":
             self.quota_selected = str(arg or "")
@@ -1871,16 +2071,11 @@ class IslandWindow(QWidget):
         gauge = 19 * scale
         x = left
 
-        level = self.data.get("battery")
+        level = self._battery_level()
         clock_text = self._clock_text(datetime.now())
         clock_px = 13.5 * scale
         clock_w = render.text_width(clock_text, clock_px, QFont.DemiBold)
-        pct = "--" if level is None else f"{int(level * 100)}%"
-        bat_token = ("success" if self.data.get("charging", False) else
-                     "danger" if level is not None and level < 0.15 else
-                     "textSecondary")
-        pct_w = render.text_width(pct, 9 * scale, QFont.DemiBold)
-        bat_w = (pct_w + 2 * scale + 22 * scale) if level is not None else 0.0
+        bat_w = render.BATTERY_W * scale if level is not None else 0.0
         bat_x = right - bat_w
         clock_x = bat_x - (gap if bat_w else 0) - clock_w
 
@@ -1940,6 +2135,9 @@ class IslandWindow(QWidget):
                 elif kind_name == "mail":
                     render.paint_envelope(p, x + 6 * scale, cy, 14 * scale,
                                           theme, "accent")
+                elif kind_name == "meeting":
+                    render.paint_checklist(p, x + 1 * scale, cy, 15 * scale,
+                                           theme, "accent")
                 else:
                     render.paint_drop(p, x + 9 * scale, cy, 14 * scale,
                                       theme, "accent")
@@ -1948,7 +2146,7 @@ class IslandWindow(QWidget):
                               r.height()),
                     label, theme, 10.5 * scale, QFont.DemiBold,
                     Qt.AlignLeft | Qt.AlignVCenter,
-                    token="accent" if kind_name in ("mail", "water") else
+                    token="accent" if kind_name in ("mail", "water", "meeting") else
                     "textPrimary")
                 p.restore()
                 chip = QRectF(x, cy - 9 * scale, width, 18 * scale)
@@ -1989,6 +2187,22 @@ class IslandWindow(QWidget):
                     render.paint_drop(p, x + 8 * scale, cy, 14 * scale,
                                       theme, "accent")
                     label = "喝水"
+                elif kind == "meeting":
+                    token = "accent"
+                    render.paint_checklist(p, x + 1 * scale, cy, 15 * scale,
+                                           theme, "accent")
+                    label = "会议待办"
+                elif kind == "stock":
+                    token = self._stock_token()
+                    label = self._stock_chip_text()
+                    render.paint_text(
+                        p, QRectF(x + 4 * scale, r.top(), width - 4 * scale,
+                                  r.height()),
+                        label, theme, 9.5 * scale, QFont.DemiBold,
+                        Qt.AlignLeft | Qt.AlignVCenter, token=token)
+                    self._compact_hits.append((chip, page))
+                    x += width + gap
+                    continue
                 else:
                     token = "success"
                     render.paint_checklist(p, x + 1 * scale, cy, 14 * scale,
@@ -2014,14 +2228,14 @@ class IslandWindow(QWidget):
                           r.height()),
                 weather["text"], theme, weather["text_px"], QFont.DemiBold,
                 Qt.AlignLeft | Qt.AlignVCenter, token="textPrimary")
+            self._compact_hits.append((
+                QRectF(weather_x, r.top(), weather["width"] + 2 * scale,
+                       r.height()), "weather"))
         render.paint_text(p, QRectF(clock_x, r.top(), clock_w + 1, r.height()),
                           clock_text, theme, clock_px, QFont.DemiBold,
                           Qt.AlignRight | Qt.AlignVCenter, token="clock")
         if level is not None:
-            render.paint_text(p, QRectF(bat_x, r.top(), pct_w + 1, r.height()),
-                              pct, theme, 9 * scale, QFont.DemiBold,
-                              Qt.AlignRight | Qt.AlignVCenter, token=bat_token)
-            render.paint_battery(p, bat_x + pct_w + 2 * scale, cy, level, theme,
+            render.paint_battery(p, bat_x, cy, level, theme,
                                  self.data.get("charging", False), scale)
 
     def _line_status(self):
@@ -2077,6 +2291,8 @@ class IslandWindow(QWidget):
             "mail": self._paint_mail,
             "calendar": self._paint_calendar,
             "quota": self._paint_quota,
+            "stock": self._paint_stock,
+            "weather": self._paint_weather,
             "monitor": self._paint_monitor,
             "tools": self._paint_tools,
         }[self.page]
@@ -2155,11 +2371,10 @@ class IslandWindow(QWidget):
             dot = ("danger" if page == "tools" and self._unread else
                    "danger" if page == "focus" and self._focus_done else
                    "accent" if page == "water" and self._water_pending else
+                   "accent" if page == "todo" and self._meeting_offer else
                    "accent" if page == "mail" and mail_unread else None)
             if dot:
-                p.setBrush(theme.color(dot))
-                p.setPen(QPen(theme.color("surface"), 1))
-                p.drawEllipse(QPointF(x + slot / 2, y - 7), 2.5, 2.5)
+                render.paint_dot(p, x + slot / 2, y - 7, 2.5, theme, dot)
             p.restore()
             self._hits.append((QRectF(x, y - 12, slot, 24), "page", page))
             x += slot
@@ -2176,50 +2391,63 @@ class IslandWindow(QWidget):
     def _paint_music_page(self, p):
         state = self._music_state()
         self._paint_music(p, state)
-        if not state["present"]:
-            area = self._content_rect()
-            mem = self.data.get("memory")
-            cpu = self.data.get("cpu")
-            bat = self.data.get("battery")
-            show_monitor = self.cfg.get("show_monitor", True)
-            weather = self.data.get("weather") or {}
-            try:
-                temp = float(weather.get("temp"))
-            except (TypeError, ValueError):
-                temp = None
-            weather_text = ("--" if temp is None else
-                            f"{weather.get('text', '')} {temp:.0f}°".strip())
-            volume = self.data.get("volume")
-            cells = []
-            if show_monitor:
-                down = format_rate(self.data.get("net_down"))
-                up = format_rate(self.data.get("net_up"))
-                online = self.data.get("online")
-                network = ("离线" if online is False else
-                           "不可用" if down == "--" and up == "--" else
-                           f"↓{down} ↑{up}" if down != "--" else "在线")
-                cells += [
-                    ("CPU", "--" if cpu is None else f"{int(cpu * 100)}%"),
-                    ("内存", "--" if mem is None else f"{int(mem * 100)}%"),
-                ]
-            cells.append(
-                ("电量", "--" if bat is None else f"{int(bat * 100)}%"))
-            if show_monitor:
-                cells.append(("网络", network))
-            cells += [
-                ("天气", weather_text),
-                ("音量", "--" if volume is None else f"{int(volume * 100)}%"),
-            ]
-            grid = QRectF(area.left() + 68, area.top() + 34,
-                          area.width() - 68, area.height() - 34)
-            cell = grid.width() / 3
-            for index, (label, value) in enumerate(cells):
-                x = grid.left() + cell * (index % 3)
-                y = grid.top() + (index // 3) * 24
-                render.paint_text(p, QRectF(x, y, cell, 11), label,
-                                  self.theme, 9, token="textTertiary")
-                render.paint_text(p, QRectF(x, y + 10, cell - 9, 15), value,
-                                  self.theme, 10, QFont.DemiBold)
+        if state["present"]:
+            return
+        self._paint_status_cells(p)
+        volume = self.data.get("volume")
+        if self._volume_open and volume is not None:
+            self._paint_volume_popup(p, volume)
+
+    def _paint_status_cells(self, p):
+        """Idle music page doubles as the resource readout."""
+        theme = self.theme
+        area = self._content_rect()
+        mem = self.data.get("memory")
+        cpu = self.data.get("cpu")
+        bat = self.data.get("battery")
+        charging = bool(self.data.get("charging"))
+        down = format_rate(self.data.get("net_down"))
+        up = format_rate(self.data.get("net_up"))
+        online = self.data.get("online")
+        network = ("离线" if online is False else
+                   "不可用" if down == "--" and up == "--" else
+                   f"↓{down} ↑{up}" if down != "--" else "在线")
+        cells = [
+            ("CPU", "--" if cpu is None else f"{int(cpu * 100)}%",
+             _meter_token(cpu)),
+            ("内存", "--" if mem is None else f"{int(mem * 100)}%",
+             _meter_token(mem)),
+            ("电量", "--" if bat is None else f"{int(bat * 100)}%",
+             "success" if charging else
+             "danger" if bat is not None and bat <= 0.15 else
+             "textPrimary" if bat is not None else "textTertiary"),
+            ("网络", network, "danger" if online is False else
+             "textTertiary" if network == "不可用" else "textPrimary"),
+        ]
+        strip = area.bottom() - 33
+        p.save()
+        p.setPen(QPen(theme.color("hairline"), 1))
+        p.drawLine(QPointF(area.left(), strip), QPointF(area.right(), strip))
+        p.restore()
+        unit = area.width() / 5
+        for index, (label, value, token) in enumerate(cells):
+            left = area.left() + index * unit
+            width = unit * (5 - index) if index == len(cells) - 1 else unit
+            pad = 0.0 if index == 0 else 12.0
+            if index:
+                p.save()
+                p.setPen(QPen(theme.color("hairline"), 1))
+                p.drawLine(QPointF(left, strip + 5),
+                           QPointF(left, area.bottom() - 3))
+                p.restore()
+            render.paint_text(p, QRectF(left + pad, strip + 5,
+                                        width - pad - 6, 11),
+                              label, theme, 9, token="textTertiary")
+            render.paint_text(p, QRectF(left + pad, strip + 16,
+                                        width - pad - 6, 15),
+                              render.elide(value, 12, width - pad - 6,
+                                           QFont.DemiBold),
+                              theme, 12, QFont.DemiBold, token=token)
 
     def _paint_todo(self, p):
         theme = self.theme
@@ -2229,6 +2457,14 @@ class IslandWindow(QWidget):
         done, total = self.productivity.progress(today)
         order = self.productivity.display_order(today)
         editing = self._todo_adding or self._todo_editing is not None
+        detail = self._todo_detail
+        if (detail is not None and not editing
+                and 0 <= detail < len(self.productivity.todos)
+                and self._todo_details(self.productivity.todos[detail])):
+            self._paint_todo_detail(p, area,
+                                    self.productivity.todos[detail])
+            return
+        self._todo_detail = None
 
         render.paint_text(p, QRectF(area.left(), area.top() - 4, 46, 36),
                           str(done), theme, 29, QFont.Bold,
@@ -2238,11 +2474,11 @@ class IslandWindow(QWidget):
                           token="textSecondary")
         render.paint_text(p, QRectF(area.left(), area.top() + 30, 90, 12),
                           "今日完成", theme, 9.5, token="textSecondary")
-        add = QRectF(area.left(), area.top() + 44, 72, 24)
+        add = QRectF(area.left(), area.top() + 44, 72, 20)
         render.paint_button(p, add, "+ 添加", theme,
                             active=not editing)
         self._hits.append((add, "todo_add", None))
-        edit = QRectF(area.left() + 78, area.top() + 44, 70, 24)
+        edit = QRectF(area.left(), add.bottom() + 4, 72, 20)
         chosen = editing or self._todo_choosing
         render.paint_button(p, edit, "取消" if chosen else "改一下", theme,
                             active=chosen)
@@ -2253,6 +2489,35 @@ class IslandWindow(QWidget):
         p.setBrush(theme.color("fill"))
         p.drawRoundedRect(card, 10, 10)
         p.restore()
+
+        offer = self._meeting_offer
+        if offer is not None and not editing:
+            render.paint_text(p, QRectF(card.left() + 8, card.top() + 7,
+                                        card.width() - 16, 14),
+                              "识别到会议邀请 · 是否创建待办", theme, 9.5,
+                              QFont.DemiBold, token="accent")
+            render.paint_text(p, QRectF(card.left() + 8, card.top() + 24,
+                                        card.width() - 16, 14),
+                              render.elide(offer["text"], 9.5,
+                                          card.width() - 16), theme, 9.5)
+            note = (f"{offer['remind']} 提醒" if offer["remind"]
+                    else "会议时间已过 · 只记待办")
+            if offer.get("code"):
+                note += f" · 会议号 {offer['code']}"
+            render.paint_text(p, QRectF(card.left() + 8, card.top() + 40,
+                                        card.width() - 16, 12),
+                              note, theme, 9,
+                              QFont.Normal,
+                              Qt.AlignLeft | Qt.AlignVCenter,
+                              token="textTertiary")
+            accept = QRectF(card.left() + 8, card.bottom() - 30, 76, 23)
+            render.paint_button(p, accept, "创建待办", theme, active=True,
+                                px=9.5)
+            self._hit(accept, "meeting_accept")
+            reject = QRectF(accept.right() + 8, accept.top(), 48, 23)
+            render.paint_button(p, reject, "忽略", theme, px=9.5)
+            self._hit(reject, "meeting_reject")
+            return
 
         if not editing:
             label = f"今日 {total} 项"
@@ -2321,10 +2586,10 @@ class IslandWindow(QWidget):
                 p.drawEllipse(box)
                 if item_done:
                     p.setPen(QPen(theme.color("surface"), 1.4))
-                    p.drawLine(QPointF(box.left() + 2.4, box.center().y()),
+                    p.drawLine(QPointF(box.left() + 2.4, row.center().y()),
                                QPointF(box.center().x(), box.bottom() - 2.6))
                     p.drawLine(QPointF(box.center().x(), box.bottom() - 2.6),
-                               QPointF(box.right() - 2.0, box.top() + 2.8))
+                               QPointF(box.right() - 2.0, row.top() + 2.8))
                 p.restore()
             tag = " · ".join(part for part in (
                 repeat_tag(item.get("repeat")), item.get("remind") or "")
@@ -2360,13 +2625,72 @@ class IslandWindow(QWidget):
                 close = QRectF(row.right() - 16, y + 4, 14, 15)
                 render.paint_close(p, close.center().x(), close.center().y(),
                                    6, theme)
-                if due:
+                if self._todo_details(item):
+                    # 有会议细节的行：点文字看详情，勾完成只点左边的圆圈
+                    render.paint_chevron(p, row.right() - 26, row.center().y(),
+                                         1, theme, 0.7)
+                    self._hits.append(
+                        (QRectF(row.left(), y, 20, row_h - 1), "todo_toggle",
+                         index))
+                    self._hits.append(
+                        (QRectF(20 + row.left(), y, row.width() - 38, row_h - 1),
+                         "todo_detail", index))
+                elif due or item.get("remind_on"):
                     self._hits.append((row.adjusted(0, 0, -18, 0),
                                        "todo_toggle", index))
                 self._hits.append((close, "todo_remove", index))
         if len(rows_order) > visible:
             self._paint_scrollbar(p, card.adjusted(0, 14, -2, -4), offset,
                                   len(rows_order), visible)
+
+    def _todo_details(self, item):
+        """Fields worth a detail view: meeting number, room, join link."""
+        meeting_info = item.get("meeting") or {}
+        rows = []
+        day = item.get("remind_on") or ""
+        clock = item.get("remind") or ""
+        if day or clock:
+            rows.append(("时间", f"{day} {clock}".strip(), ""))
+        for label, key in (("会议号", "code"), ("地点", "place"),
+                           ("链接", "link")):
+            value = meeting_info.get(key) or ""
+            if value:
+                rows.append((label, value, value))
+        return rows
+
+    def _paint_todo_detail(self, p, area, item):
+        theme = self.theme
+        rows = self._todo_details(item)
+        back = QRectF(area.right() - 48, area.top() - 2, 48, 20)
+        render.paint_button(p, back, "返回", theme, px=9)
+        self._hits.append((back, "todo_back", None))
+        index = self._todo_detail
+        finished = self.productivity.todo_done(item)
+        toggle = QRectF(back.left() - 56, area.top() - 2, 52, 20)
+        render.paint_button(p, toggle, "取消完成" if finished else "完成",
+                            theme, active=not finished, px=9)
+        self._hits.append((toggle, "todo_toggle", index))
+        head_w = toggle.left() - area.left() - 6
+        render.paint_text(p, QRectF(area.left(), area.top() - 2, head_w, 20),
+                          render.elide(item["text"], 10.5, head_w,
+                                       QFont.DemiBold),
+                          theme, 10.5, QFont.DemiBold)
+        y = area.top() + 21
+        label_w = 34.0
+        copy_w = 40.0
+        for label, value, copy in rows[:4]:
+            room = area.width() - label_w - (copy_w + 4 if copy else 0)
+            render.paint_text(p, QRectF(area.left(), y, label_w, 16), label,
+                              theme, 9, token="textTertiary")
+            render.paint_text(p, QRectF(area.left() + label_w, y, room, 16),
+                              render.elide(value, 10, room), theme, 10)
+            if copy:
+                button = QRectF(area.right() - copy_w, y - 1, copy_w, 17)
+                render.paint_button(p, button,
+                                    "已复制" if self._copied(copy) else "复制",
+                                    theme, active=self._copied(copy), px=9)
+                self._hits.append((button, "copy", copy))
+            y += 18
 
     def _paint_focus(self, p):
         theme = self.theme
@@ -2522,14 +2846,6 @@ class IslandWindow(QWidget):
             render.paint_button(p, read_all, "全部已读", theme, px=9)
             self._hits.append((read_all, "mail_read_all", None))
 
-        for index, (key, label) in enumerate((
-                ("all", f"全部 {len(visible)}"),
-                ("unread", f"未读 {unread}"))):
-            tab = QRectF(list_x + index * 52, area.top() - 2, 50, 19)
-            render.paint_button(p, tab, label, theme,
-                                active=self._mail_filter == key, px=9)
-            self._hits.append((tab, "mail_filter", key))
-
         if op_active:
             status, token = self._mail_op_message, self._mail_op_token
         elif not has_card:
@@ -2537,15 +2853,41 @@ class IslandWindow(QWidget):
                              else self._status_line(result, "IMAP", "邮件"))
         else:
             status, token = "", "textTertiary"
+        band_right = refresh.left() - 4
+        status_right = band_right - (48 if show_read_all else 0)
+        status_x = list_x + 112
+        centered = False
+        # 验证码卡片优先：列表列只剩 36px，成功和进行中改用短词，
+        # 只有报错才借筛选按钮的整行位置，宁可截也不省
+        narrow = bool(status) and status_right - status_x < render.text_width(status, 9)
+        if narrow and token != "danger":
+            status = "已同步" if token == "success" else "同步中"
+            narrow = False
+            # 短词右对齐只剩 4px 贴住刷新按钮，改成在筛选按钮和刷新之间居中
+            band_left = list_x + 106
+            status_x = band_left + (band_right - band_left
+                                    - render.text_width(status, 9)) / 2.0
+            status_right = status_x + render.text_width(status, 9)
+            centered = True
+        if narrow:
+            status_x = list_x
+        else:
+            for index, (key, label) in enumerate((
+                    ("all", f"全部 {len(visible)}"),
+                    ("unread", f"未读 {unread}"))):
+                tab = QRectF(list_x + index * 52, area.top() - 2, 50, 19)
+                render.paint_button(p, tab, label, theme,
+                                    active=self._mail_filter == key, px=9)
+                self._hits.append((tab, "mail_filter", key))
+
         if status:
-            status_right = refresh.left() - 4 - (48 if show_read_all else 0)
-            status_x = list_x + 112
             status_width = status_right - status_x
             render.paint_text(
                 p, QRectF(status_x, area.top() - 2,
                           max(0.0, status_width), 19),
                 render.elide(status, 9, max(0.0, status_width)),
-                theme, 9, QFont.Normal, Qt.AlignRight | Qt.AlignVCenter,
+                theme, 9, QFont.Normal,
+                (Qt.AlignLeft if centered else Qt.AlignRight) | Qt.AlignVCenter,
                 token=token if token in ("danger", "success") else "textTertiary")
 
         if result.get("status") != "ok" or not visible:
@@ -2960,6 +3302,194 @@ class IslandWindow(QWidget):
                 render.elide(detail, 9, rest), theme, 9,
                 token="textTertiary")
 
+    def _paint_stock(self, p):
+        theme = self.theme
+        area = self._content_rect()
+        result = self.stock or {}
+        code = str(result.get("code") or self.cfg.get("stock_code") or "")
+        name = str(result.get("name") or code or "股票")
+        when = str(result.get("at") or "")
+        head = f"{name} · {code}" + (f" · {when}" if when else "")
+        if not self._stock_shown:
+            head += " · 休市，收起态已隐藏"
+        render.paint_text(
+            p, QRectF(area.left(), area.top(), area.width() - 52, 16),
+            render.elide(head, 9.5, area.width() - 52), theme, 9.5,
+            QFont.DemiBold, token="textSecondary")
+        busy = self._refreshing("stock")
+        refresh = QRectF(area.right() - 44, area.top() - 2, 44, 18)
+        render.paint_button(p, refresh, "刷新中" if busy else "刷新", theme,
+                            active=busy)
+        self._hits.append((refresh, "stock_refresh", None))
+
+        price = result.get("price")
+        if result.get("status") != "ok" or price is None:
+            message = ("读取行情…" if result.get("status") in (None, "loading")
+                       else result.get("error") or "行情不可用")
+            render.paint_text(
+                p, QRectF(area.left(), area.top() + 24, area.width(), 40),
+                render.elide(message, 9, area.width()), theme, 9,
+                token="textTertiary", align=Qt.AlignCenter)
+            return
+
+        token = self._stock_token()
+        try:
+            change = float(result.get("change") or 0.0)
+            pct = float(result.get("change_pct") or 0.0)
+            prev_close = float(result.get("prev_close") or 0.0)
+        except (TypeError, ValueError):
+            change = pct = prev_close = 0.0
+        body = area.top() + 20
+        render.paint_text(
+            p, QRectF(area.left(), body, 104, 26), f"{float(price):.2f}",
+            theme, 22, QFont.DemiBold, token=token)
+        render.paint_text(
+            p, QRectF(area.left(), body + 26, 104, 13),
+            f"{change:+.2f}  {pct:+.2f}%", theme, 9.5, QFont.DemiBold,
+            token=token)
+
+        high, low = result.get("high"), result.get("low")
+        if high is not None:
+            render.paint_text(
+                p, QRectF(area.left(), body + 42, 104, 11),
+                f"高 {float(high):.2f}", theme, 8.5, token="textTertiary")
+        if low is not None:
+            render.paint_text(
+                p, QRectF(area.left(), body + 52, 104, 11),
+                f"低 {float(low):.2f}", theme, 8.5, token="textTertiary")
+
+        chart = QRectF(area.left() + 106, body + 2,
+                       area.width() - 106, 58)
+        points = result.get("points") or []
+        if len(points) < 2:
+            render.paint_text(p, chart, "分时数据暂不可用", theme, 9,
+                              token="textTertiary", align=Qt.AlignCenter)
+            return
+        render.paint_trend(p, chart, points, prev_close, theme, token)
+        start = str(points[0][0])
+        end = str(points[-1][0])
+        render.paint_text(
+            p, QRectF(chart.left(), chart.bottom() + 1, 48, 10),
+            f"{start[:2]}:{start[2:]}", theme, 8, token="textTertiary")
+        render.paint_text(
+            p, QRectF(chart.right() - 48, chart.bottom() + 1, 48, 10),
+            f"{end[:2]}:{end[2:]}", theme, 8,
+            align=Qt.AlignRight | Qt.AlignVCenter, token="textTertiary")
+
+    @staticmethod
+    def _weather_day_label(index, date):
+        if index == 0:
+            return "今天"
+        if index == 1:
+            return "明天"
+        try:
+            day = datetime.strptime(str(date), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return f"D{index + 1}"
+        return "周" + WEEKDAYS_ZH[day.weekday()]
+
+    def _paint_weather(self, p):
+        theme = self.theme
+        area = self._content_rect()
+        data = self.data.get("weather") or {}
+        place = str(data.get("place") or "天气")
+        region = str(data.get("region") or "")
+        head = place + (f" · {region}" if region and region != place else "")
+        stale = bool(data.get("stale"))
+        render.paint_text(
+            p, QRectF(area.left(), area.top(), area.width() - 54, 13),
+            render.elide(head, 9.5, area.width() - 54), theme, 9.5,
+            QFont.DemiBold, token="warning" if stale else "textSecondary")
+        try:
+            when = datetime.fromtimestamp(
+                float(data.get("at"))).strftime("%H:%M")
+        except (TypeError, ValueError, OSError):
+            when = ""
+        if when:
+            render.paint_text(
+                p, QRectF(area.right() - 54, area.top(), 54, 12),
+                ("上次 " if stale else "") + when, theme, 8,
+                align=Qt.AlignRight | Qt.AlignVCenter, token="textTertiary")
+
+        temp = data.get("temp")
+        if temp is None:
+            message = str(data.get("error") or "读取天气…")
+            render.paint_text(
+                p, QRectF(area.left(), area.top() + 20, area.width(), 40),
+                render.elide(message, 9, area.width()), theme, 9,
+                token="textTertiary", align=Qt.AlignCenter)
+            return
+
+        left_w = 104.0
+        body = area.top() + 14
+        render.paint_text(
+            p, QRectF(area.left(), body, 86, 30), f"{float(temp):.0f}°",
+            theme, 26, QFont.Bold, token="textPrimary")
+        high, low = data.get("high"), data.get("low")
+        today = str(data.get("text") or "")
+        if high is not None and low is not None:
+            today += f"  {float(high):.0f}°/{float(low):.0f}°"
+        render.paint_text(
+            p, QRectF(area.left(), body + 30, left_w, 12),
+            render.elide(today, 9, left_w), theme, 9, token="textSecondary")
+        feels, humidity, wind = (data.get("feels"), data.get("humidity"),
+                                 data.get("wind"))
+        stats = []
+        if humidity is not None:
+            stats.append(f"湿度 {float(humidity):.0f}%")
+        if wind is not None:
+            stats.append(f"风 {float(wind):.0f}km/h")
+        render.paint_text(
+            p, QRectF(area.left(), body + 44, left_w, 11),
+            render.elide(" · ".join(stats), 8, left_w), theme, 8,
+            token="textTertiary")
+        if feels is not None:
+            render.paint_text(
+                p, QRectF(area.left(), body + 56, left_w, 11),
+                f"体感 {float(feels):.0f}°", theme, 8,
+                token="textTertiary")
+
+        days = [item for item in (data.get("daily") or [])
+                if isinstance(item, dict)][:7]
+        chart = QRectF(area.left() + left_w + 6, area.top() + 14,
+                       area.width() - left_w - 6, 68)
+        p.save()
+        p.setPen(QPen(theme.color("hairline"), 1.0))
+        p.drawLine(QPointF(area.left() + left_w, area.top() + 16),
+                   QPointF(area.left() + left_w, area.bottom() - 4))
+        p.restore()
+        if not days:
+            render.paint_text(p, chart, "未来 7 天暂不可用", theme, 9,
+                              token="textTertiary", align=Qt.AlignCenter)
+            return
+        col = chart.width() / 7
+        for index, day in enumerate(days):
+            x = chart.left() + col * index
+            center = x + col / 2
+            render.paint_text(
+                p, QRectF(x, chart.top(), col, 10),
+                self._weather_day_label(index, day.get("date")), theme, 8,
+                align=Qt.AlignCenter, token="textSecondary")
+            render.paint_weather_icon(
+                p, center - 7, chart.top() + 21, 14,
+                day.get("kind") or weather.kind(day.get("text")), theme)
+            high, low = day.get("high"), day.get("low")
+            render.paint_text(
+                p, QRectF(x, chart.top() + 31, col, 11),
+                "--" if high is None else f"{float(high):.0f}°", theme, 9,
+                QFont.DemiBold, align=Qt.AlignCenter, token="textPrimary")
+            render.paint_text(
+                p, QRectF(x, chart.top() + 42, col, 10),
+                "--" if low is None else f"{float(low):.0f}°", theme, 8,
+                align=Qt.AlignCenter, token="textTertiary")
+            rain = day.get("precip")
+            if rain is not None:
+                render.paint_text(
+                    p, QRectF(x, chart.top() + 52, col, 9),
+                    f"{float(rain):.0f}%", theme, 7.5,
+                    align=Qt.AlignCenter, token="accent" if rain >= 40
+                    else "textTertiary")
+
     def _paint_monitor(self, p):
         theme = self.theme
         area = self._content_rect()
@@ -3008,6 +3538,10 @@ class IslandWindow(QWidget):
             rect = QRectF(area.left() + index * 52, area.top(), 48, 19)
             active = self.tools_page == key
             render.paint_button(p, rect, label, theme, active=active, px=9)
+            if key == "notify" and self._unread:
+                # 页码豆说不清是哪个标签，这里点名
+                render.paint_dot(p, rect.right() - 6, rect.center().y(), 2.5,
+                                 theme, "danger")
             self._tools_hits.append((rect, "tools", key))
         body = QRectF(area.left(), area.top() + 25, area.width(),
                       area.height() - 25)
@@ -3320,13 +3854,30 @@ class IslandWindow(QWidget):
         p.restore()
         if not state["present"]:
             area = self._content_rect()
-            render.paint_text(p, QRectF(cover.right() + 12, area.top() + 3,
-                                        area.right() - cover.right() - 12, 17),
+            p.save()
+            p.setPen(QPen(theme.color("outline"), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(cover.adjusted(0.5, 0.5, -0.5, -0.5), 8, 8)
+            p.restore()
+            text_w = area.right() - cover.right() - 12
+            render.paint_text(p, QRectF(cover.right() + 12, area.top() + 12,
+                                        text_w, 16),
                               "暂无音乐", theme, 12, QFont.Bold)
+            hint_w = max(30.0, text_w - 70)
             render.paint_text(
-                p, QRectF(cover.right() + 12, area.top() + 20,
-                          area.right() - cover.right() - 12, 13),
-                "打开播放器后自动显示", theme, 9.5, token="textTertiary")
+                p, QRectF(cover.right() + 12, area.top() + 30,
+                          hint_w, 13),
+                render.elide("打开播放器后自动显示", 9, hint_w), theme, 9,
+                token="textTertiary")
+            volume = self.data.get("volume")
+            if volume is not None:
+                rect = QRectF(area.right() - 64, area.top() + 19, 64, 16)
+                render.paint_text(p, rect, f"音量 {int(volume * 100)}%", theme,
+                                  9, QFont.Normal,
+                                  Qt.AlignRight | Qt.AlignVCenter,
+                                  token="textTertiary")
+                self._hits.append((rect.adjusted(-4, -3, 0, 3),
+                                   "music_volume", None))
             return
         area = self._content_rect()
         has_player = state["player"]

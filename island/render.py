@@ -3,6 +3,7 @@ import math
 
 from PySide2.QtCore import QPointF, QRectF, Qt
 from PySide2.QtGui import (QColor, QFont, QFontDatabase, QFontMetrics,
+                           QFontMetricsF,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QRadialGradient)
 
@@ -159,25 +160,44 @@ def paint_surface(painter: QPainter, path: QPainterPath, theme, accent=None) -> 
     painter.restore()
 
 
+BATTERY_W = 28.0
+BATTERY_H = 13.0
+
+
 def paint_battery(painter: QPainter, x: float, cy: float, level: float, theme,
                   charging: bool = False, scale: float = 1.0) -> float:
-    w, h = 18.0 * scale, 9.0 * scale
-    body = QRectF(x, cy - h / 2, w, h)
-    painter.setPen(QPen(theme.color("textSecondary"), 1.2 * scale))
-    painter.setBrush(Qt.NoBrush)
-    painter.drawRoundedRect(body, 2.2 * scale, 2.2 * scale)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(theme.color("textSecondary"))
-    painter.drawRoundedRect(QRectF(body.right() + scale, cy - 2 * scale,
-                                   2 * scale, 4 * scale), scale, scale)
+    """Gauge with the level inside it: no separate percent label."""
+    w, h = BATTERY_W * scale, BATTERY_H * scale
+    body = QRectF(x, cy - h / 2, w - 3.2 * scale, h)
     level = max(0.0, min(1.0, level))
     color = theme.color("success") if charging else (
         theme.color("danger") if level < 0.15 else theme.color("textPrimary"))
-    painter.setBrush(color)
-    inner = body.adjusted(1.8 * scale, 1.8 * scale, -1.8 * scale, -1.8 * scale)
+    outline = QColor(color)
+    outline.setAlphaF(0.55)
+    painter.setPen(QPen(outline, 1.1 * scale))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRoundedRect(body, 3.0 * scale, 3.0 * scale)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(outline)
+    painter.drawRoundedRect(QRectF(body.right() + 1.0 * scale, cy - 2.6 * scale,
+                                   2.2 * scale, 5.2 * scale), scale, scale)
+    inner = body.adjusted(2.0 * scale, 2.0 * scale, -2.0 * scale, -2.0 * scale)
+    soft = QColor(color)
+    soft.setAlphaF(0.26)
+    painter.setBrush(soft)
     painter.drawRoundedRect(QRectF(inner.left(), inner.top(),
-                                   inner.width() * level, inner.height()), scale, scale)
-    return w + 4 * scale
+                                   max(2.0 * scale, inner.width() * level),
+                                   inner.height()), scale, scale)
+    font = ui_font(8.5 * scale, QFont.DemiBold)
+    text = str(int(round(level * 100)))
+    metrics = QFontMetricsF(font)
+    box = metrics.tightBoundingRect(text)
+    painter.setPen(color)
+    painter.setFont(font)
+    painter.drawText(
+        QPointF(body.center().x() - metrics.horizontalAdvance(text) / 2.0,
+                cy - (box.top() + box.bottom()) / 2.0), text)
+    return w
 
 
 def mix_color(first: QColor, second: QColor, share: float) -> QColor:
@@ -426,7 +446,12 @@ def paint_button(painter: QPainter, rect: QRectF, text: str, theme,
     painter.drawRoundedRect(rect, min(8.0, rect.height() / 2),
                             min(8.0, rect.height() / 2))
     painter.restore()
-    paint_text(painter, rect, text, theme, px, QFont.DemiBold, Qt.AlignCenter,
+    metrics = QFontMetricsF(ui_font(px, QFont.DemiBold))
+    box = metrics.tightBoundingRect(text)
+    # AlignCenter 居中的是行盒，中文墨迹在行盒里偏下，按钮里看着就低 1px 左右
+    drop = ((metrics.ascent() - metrics.descent()) + box.top() + box.bottom()) / 2.0
+    paint_text(painter, rect.translated(0.0, -drop), text, theme, px,
+               QFont.DemiBold, Qt.AlignCenter,
                token=token or ("accent" if active else "textSecondary"))
 
 
@@ -442,6 +467,63 @@ def paint_bar(painter: QPainter, rect: QRectF, ratio: float, theme,
         painter.drawRoundedRect(QRectF(rect.left(), rect.top(),
                                        rect.width() * ratio, rect.height()),
                                 rect.height() / 2, rect.height() / 2)
+    painter.restore()
+
+
+def paint_trend(painter: QPainter, rect: QRectF, points, baseline: float,
+                theme, token: str = "accent") -> None:
+    """Intraday line with a soft fill and the previous-close baseline."""
+    values = []
+    for point in points or []:
+        try:
+            values.append(float(point[1]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    if len(values) < 2 or rect.width() <= 2 or rect.height() <= 2:
+        return
+    marks = values + ([float(baseline)] if baseline else [])
+    low, high = min(marks), max(marks)
+    pad = (high - low) * 0.12 or max(abs(high) * 0.001, 0.01)
+    low, high = low - pad, high + pad
+
+    def point_at(index, value):
+        x = rect.left() + rect.width() * index / (len(values) - 1)
+        y = rect.bottom() - rect.height() * (value - low) / (high - low)
+        return QPointF(x, y)
+
+    line = QPainterPath(point_at(0, values[0]))
+    for index, value in enumerate(values[1:], 1):
+        line.lineTo(point_at(index, value))
+    area = QPainterPath(line)
+    area.lineTo(rect.right(), rect.bottom())
+    area.lineTo(rect.left(), rect.bottom())
+    area.closeSubpath()
+
+    color = theme.color(token)
+    fill = QLinearGradient(0.0, rect.top(), 0.0, rect.bottom())
+    top = QColor(color)
+    top.setAlphaF(0.24)
+    bottom = QColor(color)
+    bottom.setAlphaF(0.02)
+    fill.setColorAt(0.0, top)
+    fill.setColorAt(1.0, bottom)
+
+    painter.save()
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(fill)
+    painter.drawPath(area)
+    if baseline:
+        pen = QPen(theme.color("hairline"), 1.0, Qt.DashLine)
+        base_y = rect.bottom() - rect.height() * (baseline - low) / (high - low)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(rect.left(), base_y),
+                         QPointF(rect.right(), base_y))
+    pen = QPen(color, 1.6)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    painter.drawPath(line)
     painter.restore()
 
 
@@ -680,6 +762,16 @@ def paint_close(painter: QPainter, cx: float, cy: float, size: float, theme,
                      QPointF(cx + size / 2, cy + size / 2))
     painter.drawLine(QPointF(cx + size / 2, cy - size / 2),
                      QPointF(cx - size / 2, cy + size / 2))
+    painter.restore()
+
+
+def paint_dot(painter: QPainter, cx: float, cy: float, radius: float, theme,
+              token: str = "danger", ring_token: str = "surface") -> None:
+    """提醒小圆点，描边保证在任何底色上都分得出来。"""
+    painter.save()
+    painter.setBrush(theme.color(token))
+    painter.setPen(QPen(theme.color(ring_token), 1))
+    painter.drawEllipse(QPointF(cx, cy), radius, radius)
     painter.restore()
 
 

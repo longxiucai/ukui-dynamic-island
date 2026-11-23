@@ -15,3 +15,5 @@ out/
 out-arm64/
 references/
 logs/
+scripts/
+AGENTS.md
