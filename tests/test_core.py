@@ -512,6 +512,18 @@ def _at(day, hour, minute):
     return day.replace(hour=hour, minute=minute)
 
 
+def _us_at(day, hour, minute):
+    """美东交易所墙钟 -> 等价的本机时间，CI 在任意时区都成立。"""
+    exchange = day.replace(hour=hour, minute=minute)
+    base = exchange - timedelta(hours=stock.US_UTC_OFFSET)
+    for delta in range(-26, 27):
+        candidate = base + timedelta(hours=delta)
+        if (stock.local_now("usAAPL", candidate)
+                .replace(second=0, microsecond=0) == exchange):
+            return candidate
+    raise AssertionError(f"cannot map {exchange} to local time")
+
+
 def test_stock_session():
     assert stock.stamp_date("20261119161427") == "20261119"
     assert stock.stamp_date("2026-11-18 16:08:13") == "20261118"
@@ -528,13 +540,15 @@ def test_stock_session():
     assert not stock.in_session("sh000001", _at(weekend, 10, 0))
     assert stock.in_session("hk00700", _at(monday, 15, 50))
     assert not stock.in_session("hk00700", _at(monday, 16, 20))
-    # 美股 09:30-16:00 EST = 本机 22:30 至次日 05:00（11 月非夏令）
-    assert stock.in_session("usAAPL", _at(monday, 23, 0))
-    assert not stock.in_session("usAAPL", _at(monday, 22, 0))
-    assert stock.in_session("usAAPL", _at(monday + timedelta(days=1), 4, 0))
-    july = datetime(2026, 7, 15)  # 夏令时：09:30 EDT = 本机 21:30
-    assert stock.in_session("usAAPL", _at(july, 22, 0))
-    assert not stock.in_session("usAAPL", _at(july, 21, 0))
+    # 美股 09:30-16:00 美东，含收盘 15 分钟宽限；按交易所墙钟换算，不绑本机时区
+    assert stock.in_session("usAAPL", _us_at(monday, 10, 0))
+    assert not stock.in_session("usAAPL", _us_at(monday, 9, 0))
+    assert stock.in_session("usAAPL", _us_at(monday, 15, 10))
+    assert stock.in_session("usAAPL", _us_at(monday, 16, 10))
+    assert not stock.in_session("usAAPL", _us_at(monday, 16, 20))
+    july = datetime(2026, 7, 15)  # 夏令时：09:30 EDT
+    assert stock.in_session("usAAPL", _us_at(july, 10, 0))
+    assert not stock.in_session("usAAPL", _us_at(july, 9, 0))
     assert stock.in_session("unknown", _at(monday, 3, 0))
     assert stock.quote_fresh("sh000001", "20261116", monday)
     assert not stock.quote_fresh("sh000001", "20261113", monday)
