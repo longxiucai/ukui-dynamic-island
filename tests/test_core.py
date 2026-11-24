@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import subprocess
 import tempfile
 import time
 from datetime import date, datetime, timedelta
@@ -14,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 os.environ["UKUI_ISLAND_CONFIG_DIR"] = tempfile.mkdtemp() + "/config"
 os.environ["UKUI_ISLAND_STATE_DIR"] = tempfile.mkdtemp() + "/state"
 
-from island import (activity, calendar, config, geometry, lyrics, mail, motion,
+from island import (__version__, activity, autostart, calendar, config, geometry,
+                    lyrics, mail, motion,
                     meeting, music, productivity, quota, render, sources,
                     stock, theme, weather)  # noqa: E402
 
@@ -1221,6 +1223,71 @@ def test_copilot_device_login():
     assert token == "gho_session"
 
 
+def _autostart_home():
+    home = Path(tempfile.mkdtemp())
+    os.environ["XDG_CONFIG_HOME"] = str(home / "config")
+    return home
+
+
+def test_autostart_entry_is_cwd_independent():
+    # UKUI autostart launches from $HOME, where `-m island` cannot import the
+    # source tree. `--version` returns before QApplication, so this proves the
+    # entry resolves without opening a second surface on the running desktop.
+    proc = subprocess.run(autostart.command().split() + ["--version"],
+                          cwd=str(Path(tempfile.mkdtemp())),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=60)
+    out = proc.stdout.decode()
+    assert proc.returncode == 0, out
+    assert "No module named" not in out
+    assert __version__ in out
+
+
+def test_autostart_ensure_repairs_dead_entries_only():
+    original = os.environ.get("XDG_CONFIG_HOME")
+    try:
+        home = _autostart_home()
+        path = autostart._entry_path()
+        dead = ["%s -m island" % sys.executable,                    # old release
+                "/nonexistent/ukui-dynamic-island",                 # uninstalled deb
+                "%s /moved-away/run.py" % sys.executable,           # moved checkout
+                "%s -m island --self-test" % sys.executable]
+        for exec_line in dead:
+            path.unlink(missing_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("[Desktop Entry]\nExec=%s\n" % exec_line,
+                            encoding="utf-8")
+            assert autostart.ensure() is True, exec_line
+            assert ("Exec=%s" % autostart.command()) in path.read_text(encoding="utf-8")
+            assert path.stat().st_mode & 0o777 == 0o644
+            assert autostart.ensure() is False                      # idempotent
+
+        # Opt-in stays: no entry, or an empty one, is never created here.
+        for text in ("", "\n"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            assert autostart.ensure() is False
+            assert path.read_text(encoding="utf-8") == text
+        path.unlink()
+        assert autostart.ensure() is False and not path.exists()
+
+        # A live entry for another build is left alone, not stolen.
+        other = home / "config" / "other-island"
+        other.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        other.chmod(0o755)
+        path.write_text("[Desktop Entry]\nExec=%s\n" % other, encoding="utf-8")
+        assert autostart.ensure() is False
+        assert path.read_text(encoding="utf-8") == "[Desktop Entry]\nExec=%s\n" % other
+
+        assert autostart._launchable(autostart.command()) is True
+        assert autostart._launchable("%s -m island" % sys.executable) is False
+    finally:
+        if original is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = original
+
+
 if __name__ == "__main__":
     test_themes()
     test_geometry()
@@ -1251,5 +1318,7 @@ if __name__ == "__main__":
     test_trae_session()
     test_copilot_device_login()
     test_monitor_sources()
+    test_autostart_entry_is_cwd_independent()
+    test_autostart_ensure_repairs_dead_entries_only()
     print("OK: themes, geometry, config, motion, sources, weather, music, "
           "productivity, mail, calendar, quota, activity, online quota")

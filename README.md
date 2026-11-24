@@ -161,7 +161,7 @@ arm64 包在 `ubuntu-22.04-arm` runner 上用 Debian bullseye 的 PySide2 5.15.2
 | 配置 | `~/.config/ukui-dynamic-island/config.json`（0600） |
 | 待办、饮水、剪贴板、置物架 | `~/.local/state/ukui-dynamic-island/productivity.json`（0600） |
 | 日志 | `~/.local/state/ukui-dynamic-island/island.log`，超过 1 MB 轮转为 `island.log.1` |
-| 开机自启 | `~/.config/autostart/ukui-dynamic-island.desktop`（仅勾选时创建） |
+| 开机自启 | `~/.config/autostart/ukui-dynamic-island.desktop`（仅勾选时创建；条目失效时下次启动改指向当前运行的构建） |
 | 已连接账号的令牌 | `~/.config/ukui-dynamic-island/*.json`（0600） |
 
 升级时直接安装新版本的 deb，程序目录会被覆盖，用户配置保留。回滚时安装上一个版本的 deb。配置解析失败会自动回退默认值，不会阻止启动，并在日志里记录解析错误。

@@ -105,6 +105,12 @@ class IslandApp:
         self.settings_dialog = None
         self.tray = Tray(self, self.themes, self.open_settings)
         self.tray.sync(self.cfg)
+        if self.cfg.get("autostart"):
+            try:
+                if autostart.ensure():
+                    _log(f"autostart entry repaired: {autostart.command()}")
+            except OSError as exc:
+                _log(f"autostart repair failed: {exc}", "ERROR")
         self._reposition()
         if self.cfg.get("click_through"):
             QTimer.singleShot(300, lambda: self.window.set_click_through(True))
