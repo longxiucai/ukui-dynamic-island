@@ -4,7 +4,7 @@
 
 项目用 Python 3.8 和 PySide2 5.15 写，安装包自带 Qt 和 Python 运行时，装好后不用再配 Python 环境。当前版本 0.7.0，只支持 X11 会话。
 
-![展开页总览](screenshots/pages-0.7.0.png)
+![展开页总览](screenshots/pages.png)
 
 ## 功能
 

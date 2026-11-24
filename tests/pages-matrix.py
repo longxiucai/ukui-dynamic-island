@@ -19,7 +19,7 @@ os.environ["UKUI_ISLAND_STATE_DIR"] = tmp + "/state"
 from PySide2.QtGui import QColor, QImage, QPainter  # noqa: E402
 from PySide2.QtWidgets import QApplication  # noqa: E402
 
-from island import __version__, config, theme  # noqa: E402
+from island import config, theme  # noqa: E402
 from island.window import PAGES, IslandWindow  # noqa: E402
 
 
@@ -140,7 +140,9 @@ def main():
                            8 + (index // 3) * (cell_h + gap), pix)
     painter.end()
 
-    out = ROOT / "screenshots" / f"pages-{__version__}.png"
+    # Stable name, like the other matrix sheets: a release that does not change
+    # the UI must not force a rename here and a README link fix there.
+    out = ROOT / "screenshots" / "pages.png"
     if not sheet.save(str(out)):
         print(f"FAIL: cannot save {out}")
         return 1
