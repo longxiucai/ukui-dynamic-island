@@ -1210,15 +1210,27 @@ class IslandWindow(QWidget):
 
     def set_click_through(self, enabled):
         self._click_through = bool(enabled)
-        self.setWindowFlag(Qt.WindowTransparentForInput, bool(enabled))
         if enabled:
             self.set_expanded(False, animate=False)
         self.show()
         self.raise_()
         self._apply_geometry()
-        if not enabled and QGuiApplication.platformName() == "xcb":
-            x11.clear_input_shape(int(self.winId()))
+        self._sync_click_through()
         QTimer.singleShot(50, self._keep_above)
+
+    def _sync_click_through(self):
+        """穿透靠 XShape 清空输入区域，不用 Qt.WindowTransparentForInput。
+
+        那个 flag 会销毁并重建原生窗口，而且只要它开着，Qt 后续的改尺寸就
+        不再下发到 X：X 窗口停在旧宽度，岛被裁断，切桌面时还会露出旧frame。
+        """
+        if QGuiApplication.platformName() != "xcb":
+            return
+        winid = int(self.winId())
+        if self._click_through:
+            x11.drop_input_region(winid)
+        else:
+            x11.clear_input_shape(winid)
 
     def _keep_above(self):
         if QGuiApplication.platformName() == "xcb":

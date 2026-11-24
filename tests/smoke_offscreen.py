@@ -19,7 +19,8 @@ os.environ["UKUI_ISLAND_STATE_DIR"] = tmp + "/state"
 from PySide2.QtCore import (QEvent, QMimeData, QObject, QPoint, QPointF,
                             QRect, QUrl, Qt, Signal)  # noqa: E402
 from PySide2.QtGui import (QDragEnterEvent, QDropEvent, QImage,
-                           QMouseEvent, QPainter, QWheelEvent)  # noqa: E402
+                           QGuiApplication, QMouseEvent, QPainter,
+                           QWheelEvent)  # noqa: E402
 from PySide2.QtWidgets import QApplication  # noqa: E402
 
 from island import config, render, sources, theme  # noqa: E402
@@ -1746,6 +1747,43 @@ def check_tray_labels() -> None:
     tray.tray.hide()
 
 
+def check_click_through_keeps_window() -> None:
+    """穿透不能重建原生窗口：重建时改尺寸会丢，岛会被裁断。"""
+    from island import x11
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_expanded(True, animate=False)
+    winid = int(win.winId())
+    calls = []
+    real_drop, real_clear = x11.drop_input_region, x11.clear_input_shape
+    real_platform = QGuiApplication.platformName
+    x11.drop_input_region = lambda wid: calls.append(("drop", wid)) or True
+    x11.clear_input_shape = lambda wid: calls.append(("clear", wid)) or True
+    QGuiApplication.platformName = staticmethod(lambda: "xcb")
+    try:
+        win.set_click_through(True)
+        assert win.windowFlags() & Qt.WindowTransparentForInput == 0, \
+            "穿透不能再走 Qt flag，它会销毁并重建原生窗口"
+        assert int(win.winId()) == winid, "同一个 X 窗口，没有被重建"
+        assert calls[-1] == ("drop", winid), calls
+        width = win.width()
+        win.set_click_through(False)
+        assert calls[-1] == ("clear", winid), calls
+        assert win.width() == width, "关闭穿透不能改变岛的大小"
+        win.set_expanded(False, animate=False)
+        QGuiApplication.platformName = staticmethod(lambda: "wayland")
+        del calls[:]
+        win.set_click_through(True)
+        assert not calls, "非 X11 平台不碰 XShape"
+        assert win._click_through
+        win.set_click_through(False)
+    finally:
+        x11.drop_input_region, x11.clear_input_shape = real_drop, real_clear
+        QGuiApplication.platformName = real_platform
+    win.close()
+    win.deleteLater()
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])
     check_ring_gauge()
@@ -1779,6 +1817,7 @@ def main() -> int:
     check_button_ink_centered()
     check_mail_status_centered()
     check_tray_labels()
+    check_click_through_keeps_window()
     cfg = dict(config.DEFAULTS)
     cell_w, cell_h = 470, 174
     styles = ["notch", "capsule", "line"]

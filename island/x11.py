@@ -1,4 +1,4 @@
-"""X11 bits Qt5 does not expose: resetting the input shape and EWMH keep-above."""
+"""X11 bits Qt5 does not expose: input shapes, EWMH keep-above, show-desktop."""
 import ctypes
 import ctypes.util
 
@@ -56,8 +56,31 @@ def clear_input_shape(winid):
     return _run(apply)
 
 
+def drop_input_region(winid):
+    """Pass input through: set the input region to no rectangles at all.
+
+    Unlike Qt.WindowTransparentForInput this does not recreate the native
+    window, so later resizes still reach the X server.
+    """
+    def apply(x11, dpy):
+        lib = ctypes.util.find_library("Xext")
+        if not lib:
+            return False
+        xext = ctypes.CDLL(lib)
+        xext.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int]
+        xext.XShapeCombineRectangles.restype = None
+        xext.XShapeCombineRectangles(dpy, winid, SHAPE_INPUT, 0, 0, None, 0,
+                                     SHAPE_SET, 0)
+        x11.XFlush(dpy)
+        return True
+    return _run(apply)
+
+
 def keep_above(winid):
-    """Re-assert _NET_WM_STATE_ABOVE after a flag change made KWin drop it."""
+    """Re-assert _NET_WM_STATE_ABOVE after KWin has dropped it."""
     def apply(x11, dpy):
         x11.XInternAtom.restype = ctypes.c_ulong
         x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
