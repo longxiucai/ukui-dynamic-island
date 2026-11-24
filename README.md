@@ -2,7 +2,7 @@
 
 这是给银河麒麟 V10 SP1 和 UKUI 桌面做的顶边灵动岛。收起时贴在屏幕顶部，显示时间、系统状态和待处理事项。鼠标移上去展开成 420×140 的面板，移开自动收起。
 
-项目用 Python 3.8 和 PySide2 5.15 写，安装包自带 Qt 和 Python 运行时，装好后不用再配 Python 环境。当前版本 0.7.0，只支持 X11 会话。
+项目用 Python 3.8 和 PySide2 5.15 写，安装包自带 Qt 和 Python 运行时，装好后不用再配 Python 环境。当前版本 0.7.1，只支持 X11 会话。
 
 ![展开页总览](screenshots/pages.png)
 
@@ -67,8 +67,8 @@
 ### deb 包
 
 ```bash
-sudo dpkg -i ukui-dynamic-island_0.7.0_amd64.deb   # x86_64
-sudo dpkg -i ukui-dynamic-island_0.7.0_arm64.deb   # arm64
+sudo dpkg -i ukui-dynamic-island_0.7.1_amd64.deb   # x86_64
+sudo dpkg -i ukui-dynamic-island_0.7.1_arm64.deb   # arm64
 sudo apt -f install
 ```
 
@@ -88,8 +88,8 @@ sudo apt remove ukui-dynamic-island
 
 ```bash
 mkdir -p ~/apps/ukui-dynamic-island
-tar -xzf ukui-dynamic-island-0.7.0-x86_64.tar.gz -C ~/apps/ukui-dynamic-island   # x86_64
-tar -xzf ukui-dynamic-island-0.7.0-aarch64.tar.gz -C ~/apps/ukui-dynamic-island  # arm64
+tar -xzf ukui-dynamic-island-0.7.1-x86_64.tar.gz -C ~/apps/ukui-dynamic-island   # x86_64
+tar -xzf ukui-dynamic-island-0.7.1-aarch64.tar.gz -C ~/apps/ukui-dynamic-island  # arm64
 ~/apps/ukui-dynamic-island/run.sh
 ```
 
@@ -114,8 +114,8 @@ ls -lh out/
 
 脚本会创建 `.build-venv`，安装 PySide2 5.15.2.1、PyInstaller 6.11.1 和 jeepney，然后生成：
 
-- `out/ukui-dynamic-island_0.7.0_amd64.deb`
-- `out/ukui-dynamic-island-0.7.0-x86_64.tar.gz`
+- `out/ukui-dynamic-island_0.7.1_amd64.deb`
+- `out/ukui-dynamic-island-0.7.1-x86_64.tar.gz`
 - `out/SHA256SUMS.txt`
 
 打包目录在 `dist/ukui-dynamic-island/`，可以直接运行自检：
@@ -126,7 +126,7 @@ QT_QPA_PLATFORM=offscreen dist/ukui-dynamic-island/ukui-dynamic-island --self-te
 
 发布前检查：
 
-1. `dpkg-deb -I out/ukui-dynamic-island_0.7.0_amd64.deb` 的 `Depends` 与 `ldd dist/ukui-dynamic-island/ukui-dynamic-island` 的结果对得上。
+1. `dpkg-deb -I out/ukui-dynamic-island_0.7.1_amd64.deb` 的 `Depends` 与 `ldd dist/ukui-dynamic-island/ukui-dynamic-island` 的结果对得上。
 2. 从解包后的 `/opt/ukui-dynamic-island` 目录运行 `--self-test`，不要只跑 `dist/`。
 3. 在没有 `~/.config/ukui-dynamic-island` 的账户下启动一次。
 4. 把 deb、tar.gz 和 `SHA256SUMS.txt` 一起上传到 Releases。
@@ -141,8 +141,8 @@ arm64 包在 `ubuntu-22.04-arm` runner 上用 Debian bullseye 的 PySide2 5.15.2
 
 产物在 `out-arm64/`：
 
-- `out-arm64/ukui-dynamic-island_0.7.0_arm64.deb`
-- `out-arm64/ukui-dynamic-island-0.7.0-aarch64.tar.gz`
+- `out-arm64/ukui-dynamic-island_0.7.1_arm64.deb`
+- `out-arm64/ukui-dynamic-island-0.7.1-aarch64.tar.gz`
 - `out-arm64/SHA256SUMS.txt`
 
 发布流水线在 `.github/workflows/release.yml`。推 `v*` tag 后会同时构建 amd64 和 arm64，并创建 Release。arm64 job 使用 `ubuntu-22.04-arm` runner，已在 Debian bullseye arm64 环境通过自检和离屏冒烟测试，但还没有在麒麟 ARM 真机上验证。
@@ -193,6 +193,7 @@ rm -rf ~/.config/ukui-dynamic-island ~/.local/state/ukui-dynamic-island
 以下项目还没验证：
 
 - 纯净系统。依赖列表来自开发机。
+- 开机自启。只复现了 UKUI 的执行环境（从 `$HOME` 运行同一条 `Exec`），没有重启登录验证。
 - arm64 真机。arm64 包只在 CI 中完成构建、自检和离屏测试。
 - Wayland 会话、多屏和侧边停靠。
 - CalDAV 和部分在线额度。没有用真实账号完成联调，失败时会回退本地数据。
