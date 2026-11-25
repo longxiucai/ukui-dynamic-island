@@ -1784,6 +1784,56 @@ def check_click_through_keeps_window() -> None:
     win.deleteLater()
 
 
+def check_wm_minimize_recovery() -> None:
+    """被 KWin 最小化后必须自己救回来，而且不能只看 Qt 的 isMinimized()。
+
+    showNormal() 一调用 Qt 就说不最小化了，可 WM 那边还是 Iconic，靠 Qt
+    判断的话恢复只跑一次，岛就一直不见了。
+    """
+    from island import x11
+
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.show()
+    winid = int(win.winId())
+    calls = []
+    iconic = [True]
+    real = (x11.showing_desktop, x11.minimized, x11.active_window,
+            x11.activate, x11.keep_above, QGuiApplication.platformName)
+    x11.showing_desktop = lambda: False
+    x11.minimized = lambda wid: calls.append(("query",)) or iconic[0]
+    x11.active_window = lambda: 0x1234
+    x11.activate = lambda wid: calls.append(("activate", wid)) or True
+    x11.keep_above = lambda wid: calls.append(("above", wid)) or True
+    win.isMinimized = lambda: False   # Qt 早就说不最小化了，这正是坑
+    QGuiApplication.platformName = staticmethod(lambda: "xcb")
+    try:
+        win._watch_desktop()
+        assert calls == [("query",), ("activate", winid),
+                         ("activate", 0x1234), ("above", winid)], \
+            "先问 WM，再救回来并把焦点还给原窗口: %s" % calls
+        calls.clear()
+        win._watch_desktop()
+        assert not calls, "1 秒内不重复查 WM，也不跟用户抢焦点"
+        win._restore_at = 0.0
+        iconic[0] = False
+        win._watch_desktop()
+        assert calls == [("query",)], calls
+        calls.clear()
+        win._restore_at = 0.0
+        win._watch_desktop()
+        assert calls == [("query",)], calls
+        calls.clear()
+        win.set_fullscreen_hidden(True)
+        win._restore_at = 0.0
+        win._watch_desktop()
+        assert not calls, "全屏隐藏是故意不见的，不能抢回来"
+    finally:
+        (x11.showing_desktop, x11.minimized, x11.active_window, x11.activate,
+         x11.keep_above, QGuiApplication.platformName) = real
+    win.close()
+    win.deleteLater()
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])
     check_ring_gauge()
@@ -1818,6 +1868,7 @@ def main() -> int:
     check_mail_status_centered()
     check_tray_labels()
     check_click_through_keeps_window()
+    check_wm_minimize_recovery()
     cfg = dict(config.DEFAULTS)
     cell_w, cell_h = 470, 174
     styles = ["notch", "capsule", "line"]

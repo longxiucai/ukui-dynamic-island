@@ -235,6 +235,8 @@ class IslandWindow(QWidget):
         self._hover.timeout.connect(self._poll_hover)
         self._hover.start()
         self._desktop_shown = False
+        self._restore_at = 0.0
+        self._restore_wait = 1.0
         self._desk = QTimer(self)
         self._desk.setInterval(250)
         self._desk.timeout.connect(self._watch_desktop)
@@ -1237,15 +1239,22 @@ class IslandWindow(QWidget):
             x11.keep_above(int(self.winId()))
 
     def _watch_desktop(self):
+        winid = int(self.winId())
         shown = x11.showing_desktop()
-        if not shown and not self._fs_hidden and self.isMinimized():
-            # 显示桌面会把岛一起最小化，退出后 WM 不一定帮我们恢复
-            self.showNormal()
-            x11.remap(int(self.winId()))
+        if not shown and not self._fs_hidden \
+                and time.monotonic() >= self._restore_at:
+            self._restore_at = time.monotonic() + self._restore_wait
+            # 只信 WM 的 WM_STATE，不信 Qt 的 isMinimized()：showNormal() 一
+            # 调用它就翻回 False，可 KWin 那边还是 Iconic，岛照样不见了。
+            if x11.minimized(winid):
+                # 查 WM_STATE 要走一次 X；真救不动就逐步退让，别和用户抢焦点
+                self._restore_wait = min(self._restore_wait * 2, 30.0)
+                self._restore_from_iconic(winid)
+            else:
+                self._restore_wait = 1.0
         if shown == self._desktop_shown:
             return
         self._desktop_shown = shown
-        winid = int(self.winId())
         x11.set_window_type(winid, shown)
         if shown:
             if self.isMinimized():
@@ -1255,6 +1264,21 @@ class IslandWindow(QWidget):
                 self.raise_()
         else:
             self._keep_above()
+
+    def _restore_from_iconic(self, winid):
+        """重新露面，并把键盘焦点还给原来那个窗口。
+
+        showNormal()、XMapWindow、去掉 _NET_WM_STATE_HIDDEN 实测都救不回被
+        KWin 最小化的窗口，只有 _NET_ACTIVE_WINDOW 请求有效，所以用完就把
+        焦点送回去，免得打断用户正在输入的地方。
+        """
+        owner = x11.active_window()
+        self.showNormal()
+        self.raise_()
+        x11.activate(winid)
+        if owner and owner != winid:
+            x11.activate(owner)
+        self._keep_above()
 
     def set_fullscreen_hidden(self, hidden):
         self._fs_hidden = bool(hidden)

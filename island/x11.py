@@ -5,6 +5,7 @@ import ctypes.util
 SHAPE_INPUT, SHAPE_SET = 2, 0
 CLIENT_MESSAGE, SUBSTRUCTURE = 33, 0x00180000
 STATE_ADD = 1
+ICONIC_STATE = 3
 
 
 class _ClientMessage(ctypes.Structure):
@@ -133,33 +134,88 @@ def set_window_type(winid, dock):
 def showing_desktop():
     """True while KWin's show-desktop/peek is active."""
     def apply(x11, dpy):
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        return bool(_read_first(x11, dpy, x11.XDefaultRootWindow(dpy),
+                                b"_NET_SHOWING_DESKTOP"))
+    return _run(apply)
+
+
+def minimized(winid):
+    """True when the WM keeps the window in Iconic state.
+
+    Qt 的 isMinimized() 不能用：showNormal() 一调用它就翻回 False，而 KWin
+    那边还是 Iconic，岛照样不出现，恢复分支也就再也不跑第二次。
+    """
+    def apply(x11, dpy):
+        return _read_first(x11, dpy, winid, b"WM_STATE") == ICONIC_STATE
+    return _run(apply)
+
+
+def active_window():
+    """The window the WM currently gives keyboard focus to, or 0."""
+    def apply(x11, dpy):
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        return _read_first(x11, dpy, x11.XDefaultRootWindow(dpy),
+                           b"_NET_ACTIVE_WINDOW") or 0
+    return _run(apply)
+
+
+def activate(winid):
+    """Ask the WM to un-hide and raise us via _NET_ACTIVE_WINDOW.
+
+    showNormal()、XMapWindow、去掉 _NET_WM_STATE_HIDDEN 都实测救不回被
+    KWin 最小化的窗口，只有这个请求有效。
+    """
+    def apply(x11, dpy):
         x11.XInternAtom.restype = ctypes.c_ulong
         x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
         x11.XDefaultRootWindow.restype = ctypes.c_ulong
         x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-        x11.XGetWindowProperty.restype = ctypes.c_int
-        x11.XGetWindowProperty.argtypes = [
-            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
-            ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
-            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
-            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong))]
-        x11.XFree.argtypes = [ctypes.c_void_p]
-        prop = x11.XInternAtom(dpy, b"_NET_SHOWING_DESKTOP", False)
-        kind, fmt = ctypes.c_ulong(), ctypes.c_int()
-        count, after = ctypes.c_ulong(), ctypes.c_ulong()
-        data = ctypes.POINTER(ctypes.c_ulong)()
-        status = x11.XGetWindowProperty(
-            dpy, x11.XDefaultRootWindow(dpy), prop, 0, 1, False, 6,
-            ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(count),
-            ctypes.byref(after), ctypes.byref(data))
-        if status != 0 or not data:
-            return False
-        try:
-            return bool(count.value and data[0])
-        finally:
-            x11.XFree(data)
+        x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                   ctypes.c_long, ctypes.c_void_p]
+        event = _Event()
+        event.cm.type = CLIENT_MESSAGE
+        event.cm.send_event = 1
+        event.cm.display = dpy
+        event.cm.window = winid
+        event.cm.message_type = x11.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", False)
+        event.cm.format = 32
+        event.cm.data[0] = 2  # source: not the user, KWin may still refuse
+        x11.XSendEvent(dpy, x11.XDefaultRootWindow(dpy), False, SUBSTRUCTURE,
+                       ctypes.byref(event))
+        x11.XFlush(dpy)
+        return True
     return _run(apply)
+
+
+def _read_first(x11, dpy, window, name):
+    """First long of a window property, or None when it is missing."""
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XGetWindowProperty.restype = ctypes.c_int
+    x11.XGetWindowProperty.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+        ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong))]
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    prop = x11.XInternAtom(dpy, name, False)
+    kind, fmt = ctypes.c_ulong(), ctypes.c_int()
+    count, after = ctypes.c_ulong(), ctypes.c_ulong()
+    data = ctypes.POINTER(ctypes.c_ulong)()
+    status = x11.XGetWindowProperty(
+        dpy, window, prop, 0, 1, False, 0,
+        ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(count),
+        ctypes.byref(after), ctypes.byref(data))
+    if status != 0 or not data:
+        return None
+    try:
+        return data[0] if count.value else None
+    finally:
+        x11.XFree(data)
 
 
 def remap(winid):
