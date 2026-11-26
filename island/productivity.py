@@ -1,4 +1,5 @@
 """Small local productivity store: todos, water, clipboard and shelf paths."""
+import hashlib
 import json
 import os
 import tempfile
@@ -13,6 +14,9 @@ MAX_CLIPS = 30
 MAX_PINNED = 5
 MAX_CLIP_CHARS = 20_000
 MAX_SHELF = 20
+# 剪贴图片：单张字节数和张数都设上限，免得天天截图把内存和临时目录撑爆
+MAX_CLIP_BYTES = 12_000_000
+MAX_CLIP_IMAGES = 6
 WATER_GOAL = 2000
 WATER_STEP = 250
 WEEKDAY_TEXT = "一二三四五六日"
@@ -53,14 +57,20 @@ def repeat_tag(days):
 
 
 class Productivity:
-    def __init__(self, path=None):
+    def __init__(self, path=None, image_dir=None):
         self.path = Path(path) if path else config.state_dir() / "productivity.json"
+        # 剪贴暂存和剪贴板同寿命：放 /tmp，重启后由系统清，不用我们自己扫。
+        # 名字不能和 SingleInstance 的 /tmp 套接字撞上。
+        self.image_dir = Path(image_dir) if image_dir else (
+            Path(tempfile.gettempdir())
+            / ("ukui-dynamic-island-clips-%d" % os.getuid()))
         self.load_error = ""
         self.todos = []
         self.water_date = ""
         self.water_ml = 0
         self.clips = []
         self.shelf = []
+        self._clip_blobs = {}
         self._load()
 
     def _load(self):
@@ -94,12 +104,19 @@ class Productivity:
             self.water_ml = 0
         for row in raw.get("clips", []):
             if isinstance(row, dict) and isinstance(row.get("text"), str) and row["text"].strip():
+                kind = str(row.get("kind") or "text")
+                if kind != "text":
+                    continue        # 图片只活在内存里，重启不假装还在
                 self.clips.append({"text": row["text"],
                                    "at": str(row.get("at") or ""),
-                                   "pinned": bool(row.get("pinned"))})
+                                   "pinned": bool(row.get("pinned")),
+                                   "kind": "text", "size": ""})
         self.clips = self.clips[:MAX_CLIPS]
+        staging = str(self.image_dir) + os.sep
         for value in raw.get("shelf", []):
             if isinstance(value, str) and value and value not in self.shelf:
+                if value.startswith(staging) and not os.path.exists(value):
+                    continue    # /tmp 被清掉了，这张暂存卡片也就没了
                 self.shelf.append(value)
         self.shelf = self.shelf[:MAX_SHELF]
         self._today()
@@ -253,20 +270,106 @@ class Productivity:
         if self.clips and self.clips[0]["text"] == text:
             return False
         pinned = False
-        for item in self.clips:
-            if item["text"] == text:
-                pinned = bool(item.get("pinned"))
-                break
+        same = [item for item in self.clips if item["text"] == text]
+        for item in same:
+            pinned = pinned or bool(item.get("pinned"))
+            self._drop_image(item)      # 图片标题可能正好等于这段文字
         self.clips = [item for item in self.clips if item["text"] != text]
         self.clips.insert(0, {"text": text,
                               "at": at or datetime.now().strftime("%H:%M"),
-                              "pinned": pinned})
+                              "pinned": pinned, "kind": "text",
+                              "size": ""})
+        for item in self.clips[MAX_CLIPS:]:
+            self._drop_image(item)
         self.clips = self.clips[:MAX_CLIPS]
         self._save()
         return True
 
+    def record_clip_image(self, blob, width, height, at=None):
+        """剪贴板图片进历史：只在内存里留 PNG 字节，不默认写盘。
+
+        截图天天有，全部落盘会把状态目录塞满；只有"上架"才存成文件。
+        """
+        if not blob or len(blob) > MAX_CLIP_BYTES or width <= 0 or height <= 0:
+            return False
+        key = hashlib.sha256(blob).hexdigest()[:16]
+        size = "%dx%d" % (int(width), int(height))
+        if self.clips and self.clips[0].get("key") == key:
+            return False
+        kept = next((item for item in self.clips if item.get("key") == key),
+                    None)
+        if kept:
+            self.clips.remove(kept)
+            kept["at"] = at or datetime.now().strftime("%H:%M")
+        else:
+            kept = {"text": "图片 " + size,
+                    "at": at or datetime.now().strftime("%H:%M"),
+                    "pinned": False, "kind": "image", "key": key, "size": size}
+        self.clips.insert(0, kept)
+        self._clip_blobs[key] = blob
+        stale = self.clips[MAX_CLIPS:]
+        self.clips = self.clips[:MAX_CLIPS]
+        for item in stale:
+            self._drop_image(item)
+        for item in [row for row in self.clips
+                     if row.get("kind") == "image"][MAX_CLIP_IMAGES:]:
+            self._drop_image(item)
+            self.clips.remove(item)
+        self._save()
+        return True
+
+    def clip_blob(self, key):
+        """图片条目的 PNG 字节；重启后内存清空就没有了。"""
+        return self._clip_blobs.get(key)
+
+    def clip_to_shelf(self, item):
+        """把剪贴图片存成 png 并放进取物架，返回该路径；失败返回 ""。"""
+        if not item or item.get("kind") != "image":
+            return ""
+        blob = self._clip_blobs.get(item.get("key") or "")
+        if not blob:
+            return ""
+        try:
+            self.image_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self.image_dir.stat().st_uid != os.getuid():  # 别人抢先占了这个名字
+                return ""
+            os.chmod(self.image_dir, 0o700)
+            path = self.image_dir / (item["key"] + ".png")
+            if not path.exists():
+                fd, tmp = tempfile.mkstemp(dir=str(self.image_dir),
+                                           suffix=".png")
+                os.close(fd)
+                try:
+                    Path(tmp).write_bytes(blob)
+                    os.chmod(tmp, 0o600)
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+        except OSError:
+            return ""
+        self.add_shelf(str(path))
+        return str(path)
+
+    def _drop_image(self, item):
+        """图片条目被挤掉/删除时回收内存字节；已上架的文件留给置物架。"""
+        self._clip_blobs.pop(item.get("key") or "", None)
+
+    def _drop_staging(self, path):
+        """下架：剪贴图片只是我们自己暂存的副本，卡片没了就该删掉。
+
+        只认我们自己的暂存目录，用户拖进置物架的文件永远不碰。
+        """
+        if not path or not str(path).startswith(str(self.image_dir) + os.sep):
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def remove_clip(self, index):
         if 0 <= index < len(self.clips):
+            self._drop_image(self.clips[index])
             self.clips.pop(index)
             self._save()
             return True
@@ -275,6 +378,9 @@ class Productivity:
     def clear_clips(self):
         kept = [item for item in self.clips if item.get("pinned")]
         if len(kept) != len(self.clips):
+            for item in self.clips:
+                if item not in kept:
+                    self._drop_image(item)
             self.clips = kept
             self._save()
 
@@ -298,18 +404,23 @@ class Productivity:
         if not value or value in self.shelf or not Path(value).exists():
             return False
         self.shelf.insert(0, value)
+        for dropped in self.shelf[MAX_SHELF:]:
+            self._drop_staging(dropped)   # 被挤掉的卡片别留下没人引用的暂存
         self.shelf = self.shelf[:MAX_SHELF]
         self._save()
         return True
 
     def remove_shelf(self, index):
         if 0 <= index < len(self.shelf):
-            self.shelf.pop(index)
+            path = self.shelf.pop(index)
+            self._drop_staging(path)
             self._save()
             return True
         return False
 
     def clear_shelf(self):
         if self.shelf:
+            for path in self.shelf:
+                self._drop_staging(path)
             self.shelf = []
             self._save()

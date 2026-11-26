@@ -824,6 +824,58 @@ def paint_clipboard(painter: QPainter, cx: float, cy: float, size: float, theme,
     painter.restore()
 
 
+def paint_thumbnail(painter: QPainter, rect: QRectF, pixmap, theme,
+                    radius: float = 3.0, fallback=None) -> bool:
+    """圆角裁切地铺满 pixmap；没有可用图时调用 fallback 画占位图标。
+
+    pixmap 由调用方负责读盘和缓存，这里只做绘制，保持 render 无 IO。
+    """
+    if pixmap is None or pixmap.isNull():
+        if fallback is not None:
+            fallback()
+        return False
+    painter.save()
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    painter.setClipPath(path)
+    size = rect.size().toSize()
+    scaled = pixmap.scaled(size, Qt.KeepAspectRatioByExpanding,
+                           Qt.SmoothTransformation)
+    left = rect.left() + (size.width() - scaled.width()) / 2.0
+    top = rect.top() + (size.height() - scaled.height()) / 2.0
+    painter.drawPixmap(QRectF(left, top, scaled.width(), scaled.height()).toRect(),
+                       scaled)
+    painter.restore()
+    painter.save()
+    painter.setPen(QPen(theme.color("hairline"), 1))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.restore()
+    return True
+
+
+def paint_picture(painter: QPainter, cx: float, cy: float, size: float, theme,
+                  token: str = "textTertiary") -> None:
+    """图片占位符：相框加一座小山，缩略图读不出来时用。"""
+    painter.save()
+    color = theme.color(token)
+    painter.setPen(QPen(color, max(1.0, size * 0.09), Qt.SolidLine, Qt.RoundCap,
+                        Qt.RoundJoin))
+    painter.setBrush(Qt.NoBrush)
+    frame = QRectF(cx - size * 0.42, cy - size * 0.34, size * 0.84, size * 0.68)
+    painter.drawRoundedRect(frame, size * 0.1, size * 0.1)
+    path = QPainterPath()
+    path.moveTo(frame.left() + size * 0.08, frame.bottom() - size * 0.1)
+    path.lineTo(frame.left() + size * 0.3, cy + size * 0.02)
+    path.lineTo(frame.left() + size * 0.46, frame.bottom() - size * 0.1)
+    painter.drawPath(path)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(color)
+    painter.drawEllipse(QPointF(frame.right() - size * 0.2, cy - size * 0.12),
+                        size * 0.07, size * 0.07)
+    painter.restore()
+
+
 def paint_bell(painter: QPainter, cx: float, cy: float, size: float, theme,
                token: str = "textPrimary") -> None:
     painter.save()

@@ -5,7 +5,8 @@ import sys
 import traceback
 from datetime import datetime
 
-from PySide2.QtCore import Qt, QTimer
+from PySide2.QtCore import QBuffer, QIODevice, Qt, QTimer
+from PySide2.QtGui import QImage, QImageReader
 from PySide2.QtWidgets import QApplication, QMessageBox
 
 from island import (APP_ID, APP_NAME, __version__, autostart, blur, config,
@@ -16,6 +17,7 @@ from island.mail import MailAction, MailFetcher
 from island.music import Music
 from island.notify import NotifyWatcher
 from island.presence import Presence
+from island.productivity import MAX_CLIP_BYTES
 from island.quota import Quota
 from island.settings_window import SettingsDialog
 from island.single_instance import SingleInstance
@@ -23,7 +25,7 @@ from island.sources import Sampler
 from island.stock import Stock
 from island.tray import Tray, app_icon
 from island.weather import Weather
-from island.window import IslandWindow
+from island.window import IMAGE_SUFFIXES, IslandWindow
 
 
 LOG_LIMIT = 1_000_000
@@ -298,12 +300,74 @@ class IslandApp:
     def _clip_changed(self):
         if self._clip_guard:
             return
-        text = self.QApplication_clipboard().text()
-        recorded = bool(text) and self.window.productivity.record_clip(text)
-        if self.window.offer_meeting(text):
+        clipboard = self.QApplication_clipboard()
+        mime = clipboard.mimeData()
+        text = clipboard.text()
+        if mime is not None and mime.hasUrls() and self._record_clip_files(mime):
+            self.window.update()
             return
+        if text:
+            recorded = bool(self.window.productivity.record_clip(text))
+            if self.window.offer_meeting(text):
+                return
+        else:
+            recorded = self._record_clip_image(mime)
         if recorded:
             self.window.update()
+
+    def _record_clip_files(self, mime):
+        """文件管理器复制图片只给 text/uri-list，没有图片数据，得按路径读字节。"""
+        added = False
+        for url in mime.urls():
+            path = url.toLocalFile()
+            if not path.lower().endswith(IMAGE_SUFFIXES):
+                continue
+            try:
+                if os.path.getsize(path) > MAX_CLIP_BYTES:
+                    continue
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+            except OSError:
+                continue
+            added = self._record_clip_png(blob) or added
+        return added
+
+    def _record_clip_image(self, mime):
+        """复制的图片（截图最常见）进剪贴历史，只留内存字节，上架才落盘。
+
+        Linux 剪贴板一般直接给 image/png，先照抄字节，省掉 UI 线程上的一次解码再编码。
+        """
+        if mime is None or not mime.hasImage():
+            return False
+        if "image/png" in (mime.formats() or []):
+            return self._record_clip_png(bytes(mime.data("image/png")))
+        image = QImage(mime.imageData())
+        if image.isNull():
+            return False
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        try:
+            if not image.save(buffer, "PNG"):
+                return False
+            blob = bytes(buffer.data())
+        finally:
+            buffer.close()
+        return self.window.productivity.record_clip_image(
+            blob, image.width(), image.height())
+
+    def _record_clip_png(self, blob):
+        """PNG 字节先验尺寸再入历史；解不了的不收。"""
+        if not blob:
+            return False
+        probe = QBuffer()
+        probe.setData(blob)
+        probe.open(QIODevice.ReadOnly)
+        size = QImageReader(probe).size()
+        probe.close()
+        if not size.isValid():
+            return False
+        return self.window.productivity.record_clip_image(
+            blob, size.width(), size.height())
 
     def QApplication_clipboard(self):
         return self.qt.clipboard()

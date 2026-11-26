@@ -331,6 +331,96 @@ def test_todo_repeat_and_clip_pin():
     assert again.water_ml == 0
 
 
+def test_clip_image_store():
+    """剪贴图片只活在内存里，只有"上架"才落盘。"""
+    path = Path(tempfile.mkdtemp()) / "productivity.json"
+    stage = Path(tempfile.mkdtemp()) / "clips"
+    store = productivity.Productivity(path, image_dir=stage)
+    blob = b"\x89PNG\r\n\x1a\n" + b"x" * 40
+    assert store.record_clip_image(blob, 800, 600, "10:15")
+    item = store.clips[0]
+    assert item["kind"] == "image" and item["size"] == "800x600"
+    assert item["text"] == "图片 800x600"
+    assert store.clip_blob(item["key"]) == blob
+    assert not store.image_dir.exists(), "没上架就不该写盘"
+
+    # 同一张图重复复制只置顶，不多存文件
+    assert not store.record_clip_image(blob, 800, 600, "10:20"), "已在最前就什么都不做"
+    assert store.record_clip("文字内容", "10:21")
+    assert store.clips[0]["kind"] == "text"
+    assert store.record_clip_image(blob, 800, 600, "10:23")
+    images = [row for row in store.clips if row.get("kind") == "image"]
+    assert len(images) == 1 and store.clips[0]["at"] == "10:23"
+    assert store.clips[1]["kind"] == "text"
+    assert not store.record_clip_image(b"", 800, 600)
+    assert not store.record_clip_image(blob, 0, 0)
+    assert not store.record_clip_image(
+        b"y" * (productivity.MAX_CLIP_BYTES + 1), 800, 600)
+
+    # 上架才落盘：0600 的 png + 进置物架
+    image_item = store.clips[0]
+    shelf_path = store.clip_to_shelf(image_item)
+    assert shelf_path and Path(shelf_path).read_bytes() == blob
+    assert store.shelf[0] == shelf_path
+    assert oct(os.stat(shelf_path).st_mode & 0o777) == "0o600"
+    assert oct(os.stat(store.image_dir).st_mode & 0o777) == "0o700"
+    assert not store.clip_to_shelf(store.clips[1]), "文字条目上不了架"
+
+    # 超出张数上限的旧图片条目整条挤掉，内存字节一起回收
+    for index in range(productivity.MAX_CLIP_IMAGES + 2):
+        store.record_clip_image(b"\x89PNG%02d" % index + b"w" * 40, 10, 10)
+    images = [row for row in store.clips if row.get("kind") == "image"]
+    assert len(images) == productivity.MAX_CLIP_IMAGES
+    assert all(store.clip_blob(row["key"]) for row in images)
+    assert store.clip_blob("nope") is None
+
+    # 重启后内存图片没了，但已上架的文件还在
+    again = productivity.Productivity(path, image_dir=stage)
+    assert again.clip_blob(image_item["key"]) is None
+    assert again.shelf == [shelf_path]
+    assert not [row for row in again.clips if row.get("kind") == "image"]
+    assert os.path.exists(shelf_path), "置物架还在引用，不能删文件"
+
+    # 下架：暂存副本归我们管，卡片没了文件就该跟着没；拖进来的文件不碰
+    assert again.remove_shelf(0)
+    assert not os.path.exists(shelf_path), "剪贴图片只是暂存，下架要删掉"
+    keep = productivity.Productivity(path, image_dir=stage)
+    assert keep.add_shelf("/etc/hosts")
+    assert keep.remove_shelf(0)
+    assert os.path.exists("/etc/hosts"), "用户自己的文件不能删"
+    assert keep.add_shelf("/etc/hostname")
+    assert keep.add_shelf("/etc/hosts")
+    keep.clear_shelf()
+    assert keep.shelf == [] and os.path.exists("/etc/hosts")
+
+    # 架子满了再上架，被挤掉的那张暂存卡片要连文件一起没
+    crowded = productivity.Productivity(path, image_dir=stage)
+    crowded.shelf = []
+    staged = []
+    for index in range(productivity.MAX_SHELF):
+        file = crowded.image_dir / ("fill-%02d.png" % index)
+        file.write_bytes(b"\x89PNGfill%02d" % index)
+        staged.append(str(file))
+    crowded.shelf = staged                         # 末尾那张最旧，先被挤掉
+    newest = crowded.image_dir / "new.png"
+    newest.write_bytes(b"\x89PNGnew")
+    assert crowded.add_shelf(str(newest))
+    assert crowded.shelf[0] == str(newest)
+    assert not os.path.exists(staged[-1]), "挤掉的暂存卡片要连文件一起删"
+    assert os.path.exists(staged[0]), "还在架子上的不能删"
+    crowded.clear_shelf()
+    assert not any(os.path.exists(row) for row in staged), "清空要一次删干净"
+
+    # 暂存放 /tmp；重启后 /tmp 清空，架子上那张死卡片自动摘掉，别的路径不动
+    assert str(productivity.Productivity(path).image_dir).startswith(
+        tempfile.gettempdir()), "剪贴暂存应该在 /tmp 下"
+    gone = productivity.Productivity(path, image_dir=stage)
+    gone.shelf = [str(gone.image_dir / "gone.png"), "/etc/hosts"]
+    gone._save()
+    revived = productivity.Productivity(path, image_dir=stage)
+    assert revived.shelf == ["/etc/hosts"], revived.shelf
+
+
 def test_mail_parsing():
     assert mail.extract_code("您的验证码是 482913") == "482913"
     assert mail.extract_code("Verification code: 731904") == "731904"
@@ -1298,6 +1388,7 @@ if __name__ == "__main__":
     test_productivity_store()
     test_logging()
     test_todo_repeat_and_clip_pin()
+    test_clip_image_store()
     test_mail_parsing()
     test_meeting_invite()
     test_meeting_notice()

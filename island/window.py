@@ -6,12 +6,12 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 
-from PySide2.QtCore import (QEvent, QMimeData, QPoint, QPointF,
-                            QRectF, Qt, QTimer, QUrl)
+from PySide2.QtCore import (QBuffer, QEvent, QIODevice, QMimeData, QPoint,
+                            QPointF, QRectF, QSize, Qt, QTimer, QUrl)
 from PySide2.QtCore import Signal
 from PySide2.QtGui import (QColor, QDrag, QFont, QCursor, QGuiApplication,
-                           QFontMetricsF, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap)
+                           QFontMetricsF, QImageReader, QLinearGradient,
+                           QPainter, QPainterPath, QPen, QPixmap)
 from PySide2.QtWidgets import QFileDialog, QLineEdit, QWidget
 
 from island import (blur, geometry, lyrics, mail, meeting, render, stock as
@@ -25,6 +25,13 @@ from island.sources import format_rate, set_muted, set_volume
 
 HOVER_INTENT = 200
 LEAVE_DELAY = 140
+CLIP_THUMB = 18.0
+CLIP_ROW = 21.5
+CLIP_VISIBLE = 3
+CLIP_REF = "clip:"
+CLIP_THUMB_CAP = 64.0
+CLIP_PREVIEW_CAP = 720.0
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 OPEN_W, OPEN_H = (330.0, 0.70), (290.0, 0.74)
 CLOSE = (620.0, 1.0)
 CONTENT_GROW_W = (300.0, 0.70)
@@ -158,6 +165,7 @@ class IslandWindow(QWidget):
         self._quota_refresh_until = 0.0
         self._stock_refresh_until = 0.0
         self._last_mail_unread = 0
+        self._mail_unseen = set()
         self._mail_detail = None
         self._scroll = {"mail": 0, "clips": 0, "todo": 0}
         self._confirm = ("", 0.0)
@@ -176,6 +184,8 @@ class IslandWindow(QWidget):
         self._todo_reminded = {}
         self._cover_path = ""
         self._cover = None
+        self._clip_pixmaps = {}
+        self._clip_preview = ""
         self._show_lyrics = True
         self._lyric_line = ""
         self._lyric_at = -10.0
@@ -185,6 +195,8 @@ class IslandWindow(QWidget):
         self._lyrics_on = False
         self._lyrics_at = -10.0
         self._alerts = []
+        self._lit_at = {}
+        self._lit_seen = {}
         self._notice = None
         self._notice_at = -10.0
         self._notice_until = 0.0
@@ -804,6 +816,7 @@ class IslandWindow(QWidget):
             return False
         self._meeting_offer = dict(offer, until=time.monotonic()
                                    + MEETING_OFFER_SECONDS)
+        self._mark_lit("todo")
         banner = (self.expanded and self.page == "todo"
                   and not (self._todo_adding or self._todo_editing is not None))
         if not banner:
@@ -840,6 +853,7 @@ class IslandWindow(QWidget):
         if time.monotonic() < self._water_due:
             return
         self._water_pending = True
+        self._mark_lit("water")
         self._enqueue_alert("water", "喝水时间到了", "补充 250 ml 水分", "water")
         self._apply_geometry(animate=True)
 
@@ -994,6 +1008,9 @@ class IslandWindow(QWidget):
             self._page_dir = 1 if names.index(page) > old else -1
             self._page_beat.start()
         self.page = page
+        if page in dict(self._lit_pages()):
+            # 已经主动看过这页，这次亮起就不再重复跳过去
+            self._lit_seen[page] = True
         self._sync_monitor_sampling()
         if page != "todo":
             self._todo_adding = False
@@ -1004,6 +1021,8 @@ class IslandWindow(QWidget):
             self.todo_time_input.clear()
         if page != "mail":
             self._mail_detail = None
+        if page != "tools":
+            self._clip_preview = ""
         if page != "todo":
             self._todo_detail = None
         if page != "music":
@@ -1031,6 +1050,7 @@ class IslandWindow(QWidget):
     def set_tools_page(self, page):
         if page in dict(TOOLS):
             self.tools_page = page
+            self._clip_preview = ""
             if page == "notify":
                 self._unread = 0
             self.update()
@@ -1042,6 +1062,65 @@ class IslandWindow(QWidget):
 
     def _pages(self):
         return PAGES
+
+    def _lit_pages(self):
+        """亮起分页豆的页，按亮起先后排序（同一帧亮起时 danger 在前）。
+
+        画豆和展开跳页共用这一份判断，避免出现"豆亮着却跳不过去"。
+        """
+        now = time.monotonic()
+        mail_unread = any(
+            self._mail_unread(item)
+            and self._mail_key(item) not in self._mail_hidden
+            for item in (self.mail.get("items") or []))
+        states = (("tools", "danger", bool(self._unread)),
+                  ("focus", "danger", bool(self._focus_done)),
+                  ("water", "accent", bool(self._water_pending)),
+                  ("todo", "accent", self._meeting_offer is not None),
+                  ("mail", "accent", mail_unread))
+        lit = []
+        for page, token, on in states:
+            if not on:
+                self._lit_at.pop(page, None)
+                self._lit_seen.pop(page, None)
+                continue
+            if page not in self._lit_at:
+                # 开机即亮、没被 _mark_lit 记过的按此刻算
+                self._lit_at[page] = now
+                self._lit_seen.pop(page, None)
+            lit.append((page, token))
+        lit.sort(key=lambda item: self._lit_at[item[0]], reverse=True)
+        return lit
+
+    def _mark_lit(self, page):
+        """豆亮起的那一刻记账：谁最晚亮，展开就先去看谁。"""
+        self._lit_at[page] = time.monotonic()
+        self._lit_seen.pop(page, None)
+
+    def _pending_page(self):
+        """展开时优先展示的亮起页：最新的、且这次亮起还没被展示过的。
+
+        返回 None 表示没有待看的亮起页，保持展开上次那页。
+        """
+        fresh = [page for page, _ in self._lit_pages()
+                 if not self._lit_seen.get(page)]
+        if not fresh:
+            return None
+        self._lit_seen[fresh[0]] = True
+        return fresh[0]
+
+    def _reveal_lit_page(self):
+        """展开前先看一眼有没有亮起还没看过的页，有就切过去。"""
+        page = self._pending_page()
+        if not page:
+            return
+        if page == self.page:
+            # 人已经在这一页就别重开（会关掉正在看的邮件/待办详情）；
+            # 但置物架页亮的是"通知"标签，得顺手从置物/剪贴切过去
+            if page == "tools" and self._unread and self.tools_page != "notify":
+                self.set_tools_page("notify")
+            return
+        self.set_page(page)
 
     def _sync_monitor_sampling(self):
         self.monitor_focus.emit(bool(self.cfg.get("show_monitor", True))
@@ -1071,6 +1150,12 @@ class IslandWindow(QWidget):
         if unread > self._last_mail_unread:
             self._mail_pulse_until = time.monotonic() + 6.0
         self._last_mail_unread = unread
+        unseen = {self._mail_key(item) for item in items
+                  if self._mail_key(item) not in self._mail_hidden
+                  and self._mail_unread(item)}
+        if unseen - self._mail_unseen:
+            self._mark_lit("mail")
+        self._mail_unseen = unseen
         if self.mail.get("status") == "ok":
             keys = [self._mail_key(item) for item in items]
             fresh = [(index, item) for index, item in enumerate(items)
@@ -1203,6 +1288,7 @@ class IslandWindow(QWidget):
         self.notifications = self.notifications[:30]
         if self.page != "tools" or self.tools_page != "notify":
             self._unread += 1
+            self._mark_lit("tools")
             self._pet_until = time.monotonic() + 2.0
         self.update()
 
@@ -1400,6 +1486,7 @@ class IslandWindow(QWidget):
                 self.focus["phase"] = "rest" if finished == "focus" else "focus"
                 self._focus_reset()
                 self._focus_done = True
+                self._mark_lit("focus")
                 self._pet_until = time.monotonic() + 4.0
                 if self.cfg.get("focus_remind", True):
                     if finished == "focus":
@@ -1464,6 +1551,7 @@ class IslandWindow(QWidget):
 
     def _maybe_expand(self):
         if not self.expanded and self._inside():
+            self._reveal_lit_page()
             self.set_expanded(True)
 
     def _maybe_collapse(self):
@@ -1514,6 +1602,8 @@ class IslandWindow(QWidget):
         QTimer.singleShot(80, self._apply_blur)
 
     def toggle(self):
+        if not self.expanded:
+            self._reveal_lit_page()
         self.set_expanded(not self.expanded)
 
     def _content_rect(self):
@@ -1615,7 +1705,8 @@ class IslandWindow(QWidget):
                     self.music_command.emit("PlayPause")
                     return
         if self.cfg["style"] == "line" and not self.expanded:
-            self.set_expanded(not self.expanded)
+            self._reveal_lit_page()
+            self.set_expanded(True)
 
     def mouseMoveEvent(self, event):
         point = QPointF(event.pos().x() + self._window_rect.left(),
@@ -2028,6 +2119,16 @@ class IslandWindow(QWidget):
             self._pet_until = time.monotonic() + 1.5
         elif action == "clip_remove":
             self.productivity.remove_clip(int(arg))
+        elif action == "clip_preview":
+            key = str(arg or "")
+            self._clip_preview = "" if key == self._clip_preview else key
+        elif action == "clip_shelf":
+            item = next((row for row in self.productivity.clips
+                         if row.get("key") == str(arg or "")), None)
+            if item and self.productivity.clip_to_shelf(item):
+                self._clip_preview = ""
+                self.set_tools_page("shelf")
+                self._pet_until = time.monotonic() + 1.5
         elif action == "clip_pin":
             self.productivity.toggle_pin(int(arg))
         elif action == "clips_clear":
@@ -2390,11 +2491,7 @@ class IslandWindow(QWidget):
         total = slot * len(pages)
         x = panel.center().x() - total / 2
         y = panel.bottom() - 7.2
-        now = time.monotonic()
-        mail_unread = any(
-            self._mail_unread(item)
-            and self._mail_key(item) not in self._mail_hidden
-            for item in (self.mail.get("items") or []))
+        lit = dict(self._lit_pages())
         for page, _ in pages:
             active = page == self.page
             color = theme.color("accent" if active else "textTertiary")
@@ -2404,11 +2501,7 @@ class IslandWindow(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(color)
             p.drawRoundedRect(QRectF(x + slot / 2 - 2, y - 2, 4, 4), 2, 2)
-            dot = ("danger" if page == "tools" and self._unread else
-                   "danger" if page == "focus" and self._focus_done else
-                   "accent" if page == "water" and self._water_pending else
-                   "accent" if page == "todo" and self._meeting_offer else
-                   "accent" if page == "mail" and mail_unread else None)
+            dot = lit.get(page)
             if dot:
                 render.paint_dot(p, x + slot / 2, y - 7, 2.5, theme, dot)
             p.restore()
@@ -3667,9 +3760,16 @@ class IslandWindow(QWidget):
             p.setBrush(theme.color("fill"))
             p.drawRoundedRect(card, 9, 9)
             p.restore()
-            render.paint_file(p, card.center().x(), card.top() + 20, 28,
-                              theme, "textSecondary")
+            thumb = QRectF(card.center().x() - 22, card.top() + 5, 44, 30)
+            render.paint_thumbnail(
+                p, thumb, self._image_pixmap(path, CLIP_THUMB_CAP), theme,
+                radius=4.0,
+                fallback=lambda: render.paint_file(
+                    p, card.center().x(), card.top() + 20, 28, theme,
+                    "textSecondary"))
             name = os.path.basename(path.rstrip("/")) or path
+            if str(path).startswith(str(self.productivity.image_dir)):
+                name = "剪贴图片"   # 另存的文件名是内容哈希，对用户没意义
             render.paint_text(p, QRectF(card.left(), card.top() + 37,
                                         card.width(), 12),
                               render.elide(name, 9.5, card.width() - 4), theme,
@@ -3706,10 +3806,18 @@ class IslandWindow(QWidget):
             render.paint_button(p, clear, "确认?" if armed else "清空", theme,
                                 active=armed, token="danger" if armed else None)
             self._hits.append((clear, "clips_clear", None))
-        render.paint_text(p, QRectF(body.left(), body.top() - 24,
-                                    body.width() - 58, 18),
-                          f"{len(clips)} 条" + (f" · 固定 {pinned}" if pinned else "")
-                          + " · 点击复制",
+        # 156/58 是子页标签和"清空"各占的宽度，说明文字只能夹在中间
+        room = body.width() - 214
+        parts = [f"{len(clips)} 条"]
+        if any(item.get("kind") == "image" for item in clips):
+            parts.append("图片可放大")
+        if pinned:
+            parts.append(f"固定 {pinned}")
+        while len(parts) > 1 and render.text_width(" · ".join(parts), 9.5) > room:
+            parts.pop()
+        render.paint_text(p, QRectF(body.left() + 156, body.top() - 24,
+                                    room, 18),
+                          " · ".join(parts),
                           theme, 9.5, QFont.Normal,
                           Qt.AlignRight | Qt.AlignVCenter,
                           token="textTertiary")
@@ -3723,15 +3831,19 @@ class IslandWindow(QWidget):
                                    theme, "textTertiary")
             render.paint_text(p, QRectF(body.left(), body.top() + 34,
                                         body.width(), 14),
-                              "复制的文字会出现在这里", theme, 9.5,
+                              "复制的文字和图片会出现在这里", theme, 9.5,
                               QFont.DemiBold, Qt.AlignCenter)
             render.paint_text(p, QRectF(body.left(), body.top() + 49,
                                         body.width(), 12),
-                              "记录保存在本机，重新打开仍可查看", theme, 9.5,
+                              "文字记录存在本机；图片只在内存里，上架才存文件",
+                              theme, 9.5,
                               QFont.Normal, Qt.AlignCenter,
                               token="textTertiary")
             return
-        visible = 3
+        preview = self._paint_clip_preview(p, body)
+        if preview:
+            return
+        visible = CLIP_VISIBLE
         count = len(clips)
         order = sorted(range(count),
                        key=lambda index: 0 if clips[index].get("pinned") else 1)
@@ -3746,15 +3858,28 @@ class IslandWindow(QWidget):
         p.setClipRect(body, Qt.IntersectClip)
         for position, index in enumerate(order[offset:offset + visible]):
             item = clips[index]
-            y = body.top() + 1 + position * 21.5
-            row = QRectF(body.left() + 6, y, body.width() - 12, 20.5)
+            y = body.top() + 1 + position * CLIP_ROW
+            row = QRectF(body.left() + 6, y, body.width() - 12, CLIP_ROW - 1)
             if position:
                 p.save()
                 p.setPen(QPen(theme.color("hairline"), 1))
                 p.drawLine(row.bottomLeft(), row.bottomRight())
                 p.restore()
             is_pinned = bool(item.get("pinned"))
-            if is_pinned:
+            # 字节没了（理论上是重启后）就别给上架/放大，点了只会是死按钮
+            is_image = (item.get("kind") == "image"
+                        and self.productivity.clip_blob(item.get("key"))
+                        is not None)
+            ref = CLIP_REF + str(item.get("key") or "") if is_image else ""
+            if is_image:
+                thumb = QRectF(row.left() + 2, row.center().y() - CLIP_THUMB / 2,
+                               CLIP_THUMB, CLIP_THUMB)
+                render.paint_thumbnail(
+                    p, thumb, self._image_pixmap(ref, CLIP_THUMB_CAP), theme,
+                    fallback=lambda: render.paint_picture(
+                        p, thumb.center().x(), thumb.center().y(), CLIP_THUMB,
+                        theme, "textTertiary"))
+            elif is_pinned:
                 render.paint_pin(p, row.left() + 8, row.center().y(), 10,
                                  theme, "accent")
             else:
@@ -3763,29 +3888,115 @@ class IslandWindow(QWidget):
                 p.setBrush(theme.color("textTertiary"))
                 p.drawEllipse(QPointF(row.left() + 8, row.center().y()), 2.2, 2.2)
                 p.restore()
-            text = item["text"].replace("\n", " ")
-            text_w = row.width() - 92
-            render.paint_text(p, QRectF(row.left() + 18, y, text_w, 20.5),
-                              render.elide(text, 9, text_w), theme, 9,
-                              token="textPrimary" if is_pinned else "textSecondary")
+            # 图片行多一个"上架"，时间和文字依次往左让位
+            shelf = None
+            left_of = 37
+            if is_image:
+                shelf = QRectF(row.right() - 72, y + 1, 34, 18)
+                render.paint_button(p, shelf, "上架", theme, px=8.5)
+                left_of = 72
+            stamp = QRectF(row.right() - left_of - 34, y, 34, CLIP_ROW - 1)
             copied = self._copied(item["text"])
-            render.paint_text(p, QRectF(row.right() - 71, y, 34, 20.5),
+            render.paint_text(p, stamp,
                               "已复制" if copied else item.get("at", ""),
                               theme, 9, QFont.Normal,
                               Qt.AlignRight | Qt.AlignVCenter,
                               token="accent" if copied else "textTertiary")
+            text = item["text"].replace("\n", " ")
+            text_left = row.left() + (25 if is_image else 18)
+            text_w = stamp.left() - text_left - 6
+            render.paint_text(p, QRectF(text_left, y, text_w, CLIP_ROW - 1),
+                              render.elide(text, 9, text_w), theme, 9,
+                              token="textPrimary" if is_pinned else "textSecondary")
             pin = QRectF(row.right() - 37, y + 1, 17, 18)
             render.paint_pin(p, pin.center().x(), pin.center().y(), 9, theme,
                              "accent" if is_pinned else "textTertiary")
             close = QRectF(row.right() - 18, y + 2, 15, 16)
             render.paint_close(p, close.center().x(), close.center().y(), 6,
                                theme)
-            self._hits.append((row.adjusted(0, 0, -38, 0), "copy",
-                               item["text"]))
+            if shelf is not None:
+                self._hits.append((shelf, "clip_shelf", item.get("key")))
+                self._hits.append(
+                    (QRectF(row.left(), y, stamp.left() - 6 - row.left(),
+                            CLIP_ROW - 1), "clip_preview", item.get("key")))
+            else:
+                self._hits.append((row.adjusted(0, 0, -38, 0), "copy",
+                                   item["text"]))
             self._hits.append((pin, "clip_pin", index))
             self._hits.append((close, "clip_remove", index))
         p.restore()
         self._paint_scrollbar(p, body, offset, count, visible)
+
+    def _image_pixmap(self, ref, cap=CLIP_PREVIEW_CAP):
+        """ref 是 "clip:<key>"（内存里的 PNG 字节）或图片路径。
+
+        按 cap 限尺寸解码：岛常驻，整张 4K 截图或手机照片直接解码太吃内存。
+        """
+        if not ref:
+            return None
+        key = (ref, cap)
+        cached = self._clip_pixmaps.get(key)
+        if cached is None:
+            reader = None
+            if ref.startswith(CLIP_REF):
+                blob = self.productivity.clip_blob(ref[len(CLIP_REF):])
+                if blob:
+                    probe = QBuffer()
+                    probe.setData(blob)
+                    probe.open(QIODevice.ReadOnly)
+                    reader = QImageReader(probe)
+            elif ref.lower().endswith(IMAGE_SUFFIXES):
+                reader = QImageReader(ref)
+            pixmap = QPixmap()
+            if reader is not None:
+                size = reader.size()
+                longest = max(size.width(), size.height())
+                if size.isValid() and longest > cap:
+                    share = cap / float(longest)
+                    reader.setScaledSize(QSize(int(size.width() * share),
+                                               int(size.height() * share)))
+                pixmap = QPixmap.fromImage(reader.read())
+            if len(self._clip_pixmaps) >= 12:
+                self._clip_pixmaps.pop(next(iter(self._clip_pixmaps)), None)
+            self._clip_pixmaps[key] = pixmap if not pixmap.isNull() else False
+            cached = pixmap
+        return cached or None
+
+    def _paint_clip_preview(self, p, body):
+        """图片行的缩略图太小，点开占满正文区看清楚，并给出上架/返回。"""
+        theme = self.theme
+        item = next((row for row in self.productivity.clips
+                     if row.get("kind") == "image"
+                     and row.get("key") == self._clip_preview), None)
+        if item is None:
+            self._clip_preview = ""
+            return False
+        pixmap = self._image_pixmap(CLIP_REF + str(item["key"]),
+                                    CLIP_PREVIEW_CAP)
+        if pixmap is None:
+            self._clip_preview = ""
+            return False
+        box = QRectF(body.left(), body.top(), body.width(), body.height())
+        p.save()
+        p.setPen(QPen(theme.color("outline"), 1))
+        p.setBrush(theme.color("fill"))
+        p.drawRoundedRect(box, 10, 10)
+        p.restore()
+        image = QRectF(box.left() + 8, box.top() + 6, box.width() - 118,
+                       box.height() - 12)
+        scaled = pixmap.scaled(image.size().toSize(), Qt.KeepAspectRatio,
+                               Qt.SmoothTransformation)
+        place = QRectF(image.center().x() - scaled.width() / 2.0,
+                       image.center().y() - scaled.height() / 2.0,
+                       scaled.width(), scaled.height())
+        render.paint_thumbnail(p, place, pixmap, theme, radius=4.0)
+        key = item["key"]
+        actions = (("上架", "clip_shelf", key), ("返回", "clip_preview", key))
+        for offset, (label, action, arg) in enumerate(actions):
+            rect = QRectF(box.right() - 52, box.top() + 4 + offset * 21, 44, 18)
+            render.paint_button(p, rect, label, theme, px=9)
+            self._hits.append((rect, action, arg))
+        return True
 
     def _paint_notify(self, p, body):
         theme = self.theme

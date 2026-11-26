@@ -16,15 +16,17 @@ tmp = tempfile.mkdtemp(prefix="island-smoke-")
 os.environ["UKUI_ISLAND_CONFIG_DIR"] = tmp + "/config"
 os.environ["UKUI_ISLAND_STATE_DIR"] = tmp + "/state"
 
-from PySide2.QtCore import (QEvent, QMimeData, QObject, QPoint, QPointF,
-                            QRect, QUrl, Qt, Signal)  # noqa: E402
+from PySide2.QtCore import (QBuffer, QEvent, QIODevice, QMimeData, QObject,
+                            QPoint, QPointF, QRect, QSize, QUrl, Qt,
+                            Signal)  # noqa: E402
 from PySide2.QtGui import (QDragEnterEvent, QDropEvent, QImage,
                            QGuiApplication, QMouseEvent, QPainter,
                            QWheelEvent)  # noqa: E402
 from PySide2.QtWidgets import QApplication  # noqa: E402
 
 from island import config, render, sources, theme  # noqa: E402
-from island.window import LYRIC_FADE, PAGES, IslandWindow  # noqa: E402
+from island.window import (CLIP_PREVIEW_CAP, CLIP_REF, CLIP_THUMB_CAP,
+                           LYRIC_FADE, PAGES, IslandWindow)  # noqa: E402
 
 
 def check_ring_gauge() -> None:
@@ -773,6 +775,248 @@ def check_tools_notify_dot() -> None:
     win.set_tools_page("notify")
     assert win._unread == 0
     assert notify_tab_dot() != danger
+    win.close()
+    win.deleteLater()
+
+
+def _clip_png(color=0xFF3C7DFF):
+    """造一张真实 PNG 字节，模拟剪贴板里的图片。"""
+    image = QImage(40, 24, QImage.Format_ARGB32)
+    image.fill(color)
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    image.save(buffer, "PNG")
+    buffer.close()
+    return bytes(buffer.data())
+
+
+def check_clipboard_image() -> None:
+    """剪贴图片要能看见缩略图，并且一键放进取物架。"""
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.productivity.image_dir = Path(tmp) / "clips"
+    win.set_expanded(True, animate=False)
+    win.set_page("tools")
+    win.set_tools_page("clips")
+    blob = _clip_png()
+    assert win.productivity.record_clip_image(blob, 40, 24, "10:30")
+    item = win.productivity.clips[0]
+    key = item["key"]
+
+    def actions():
+        win._page_at = time.monotonic() - 1
+        win.grab()
+        return {action: arg for _, action, arg in win._hits}
+
+    hits = actions()
+    assert hits.get("clip_shelf") == key and hits.get("clip_preview") == key
+    assert not win.productivity.image_dir.exists(), "没上架不该写盘"
+    # 缩略图区域应画出图片本色，而不是占位图标
+    win._page_at = time.monotonic() - 1
+    image = win.grab().toImage()
+    ox, oy = win._window_origin()
+    rect = next(r for r, a, g in win._hits if a == "clip_preview")
+    px = image.pixelColor(int(rect.left() + 8) - ox,
+                          int(rect.center().y()) - oy).rgba()
+    assert (px >> 16) & 0xFF == 0x3C and (px >> 8) & 0xFF == 0x7D, hex(px)
+
+    # 点开 = 放大预览，再点 = 收回
+    win._do_action("clip_preview", key)
+    assert win._clip_preview == key
+    preview = actions()
+    assert preview.get("clip_shelf") == key
+    assert not any(action == "copy" for action in preview)
+    win._do_action("clip_preview", key)
+    assert win._clip_preview == "", "再点一次收回"
+
+    # 一键上架：这时才落盘，并落到置物架子页
+    win._do_action("clip_shelf", key)
+    assert win.tools_page == "shelf"
+    path = win.productivity.shelf[0]
+    assert Path(path).read_bytes() == blob
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    win._page_at = time.monotonic() - 1
+    win.grab()
+    assert any(action == "shelf_open" and arg == path
+               for _, action, arg in win._hits)
+
+    # 下架 = 删掉我们自己的暂存副本；剪贴条目还在，可以再上架一次
+    win._do_action("shelf_remove", 0)
+    assert not os.path.exists(path), "暂存的图片下架就该删掉"
+    assert win.productivity.clip_blob(key) is not None
+    win._do_action("clip_shelf", key)
+    assert Path(win.productivity.shelf[0]).read_bytes() == blob
+
+    # 换子页/换页都要收起预览
+    win._clip_preview = key
+    win.set_page("music")
+    assert win._clip_preview == ""
+
+    # 图片字节没了（重启后）：条目退回占位图标，预览自己收起
+    stale = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    stale.productivity.clips = [dict(text="图片 40x24", at="10:40",
+                                     pinned=False, kind="image", key="gone",
+                                     size="40x24")]
+    stale.set_expanded(True, animate=False)
+    stale.set_page("tools")
+    stale.set_tools_page("clips")
+    assert stale._image_pixmap(CLIP_REF + "gone") is None
+    stale._clip_preview = "gone"
+    stale._page_at = time.monotonic() - 1
+    stale.grab()
+    assert stale._clip_preview == "", "读不出图来不能留空白预览"
+    assert not any(action == "clip_shelf" for _, action, _ in stale._hits)
+    stale.close()
+    stale.deleteLater()
+
+    # 大图按显示尺寸限流解码，别把常驻的岛撑爆
+    big = QImage(3000, 2000, QImage.Format_ARGB32)
+    big.fill(0xFF00FF00)
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    big.save(buffer, "PNG")
+    huge = bytes(buffer.data())
+    buffer.close()
+    scaled = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    assert scaled.productivity.record_clip_image(huge, 3000, 2000)
+    big_key = scaled.productivity.clips[0]["key"]
+    assert scaled._image_pixmap(CLIP_REF + big_key,
+                                CLIP_THUMB_CAP).size() == QSize(64, 42)
+    assert scaled._image_pixmap(CLIP_REF + big_key,
+                                CLIP_PREVIEW_CAP).size() == QSize(720, 480)
+    assert scaled._image_pixmap("/etc/hosts") is None, "不是图片就别当图解码"
+    scaled.close()
+    scaled.deleteLater()
+    win.close()
+    win.deleteLater()
+
+
+def check_clip_image_capture() -> None:
+    """_clip_changed 要真的把剪贴板里的图片收进历史，文字优先。"""
+    from island import app as island_app
+
+    fake = object.__new__(island_app.IslandApp)
+    fake.window = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    fake._clip_guard = False
+    png = _clip_png()
+    mime = QMimeData()
+    mime.setImageData(QImage(40, 24, QImage.Format_ARGB32))
+
+    class Clipboard:
+        def __init__(self, text="", data=None):
+            self._text, self._data = text, data
+        def text(self):
+            return self._text
+        def mimeData(self):
+            return self._data
+
+    fake.QApplication_clipboard = lambda: Clipboard("", mime)
+    fake._clip_changed()
+    item = fake.window.productivity.clips[0]
+    assert item["kind"] == "image" and item["size"] == "40x24", item
+    assert fake.window.productivity.clip_blob(item["key"])
+
+    # 剪贴板直接给 png 时照抄字节，不重新编码
+    png_mime = QMimeData()
+    png_mime.setData("image/png", png)
+    fake.QApplication_clipboard = lambda: Clipboard("", png_mime)
+    fake._clip_changed()
+    assert fake.window.productivity.clips[0]["kind"] == "image"
+
+    # 有文字就只记文字，图片那条不动
+    before = len(fake.window.productivity.clips)
+    fake.QApplication_clipboard = lambda: Clipboard("一段文字", mime)
+    fake._clip_changed()
+    assert fake.window.productivity.clips[0]["text"] == "一段文字"
+    assert len(fake.window.productivity.clips) == before + 1
+
+    # 文件管理器复制图片只给 text/uri-list，得按路径读出图片进历史
+    copied = Path(tmp) / "copied.png"
+    copied.write_bytes(_clip_png(0xFF3C7DFF))
+    url_mime = QMimeData()
+    url_mime.setUrls([QUrl.fromLocalFile(str(copied))])
+    fake.QApplication_clipboard = lambda: Clipboard("copied.png", url_mime)
+    fake._clip_changed()
+    item = fake.window.productivity.clips[0]
+    assert item["kind"] == "image" and item["size"] == "40x24", item
+    assert fake.window.productivity.clip_blob(item["key"]) == copied.read_bytes()
+
+    # 复制普通文件不冒充图片；file manager 只给 uri 时什么都不记
+    count = len(fake.window.productivity.clips)
+    plain = Path(tmp) / "notes.txt"
+    plain.write_text("hi")
+    txt_mime = QMimeData()
+    txt_mime.setUrls([QUrl.fromLocalFile(str(plain))])
+    fake.QApplication_clipboard = lambda: Clipboard("", txt_mime)
+    fake._clip_changed()
+    assert len(fake.window.productivity.clips) == count
+
+    # 空剪贴板 / 不是图片：什么都不记
+    count = len(fake.window.productivity.clips)
+    fake.QApplication_clipboard = lambda: Clipboard("", QMimeData())
+    fake._clip_changed()
+    assert len(fake.window.productivity.clips) == count
+    fake.window.close()
+    fake.window.deleteLater()
+
+
+def check_lit_page_priority() -> None:
+    """有豆亮着时，展开优先去看最晚亮起的那一页，一次亮起只跳一次。"""
+    win = IslandWindow(dict(config.DEFAULTS), theme.load("classic"))
+    win.set_page("music")
+    assert win._pending_page() is None, "没豆亮着就别乱跳"
+
+    win.set_mail({"status": "ok", "unread": 1, "items": [
+        {"sender": "a@example.com", "subject": "第一封", "date": "09:00",
+         "seen": False}]})
+    assert [page for page, _ in win._lit_pages()] == ["mail"]
+    win._reveal_lit_page()
+    assert win.page == "mail", "新未读该在展开时先看邮箱"
+    win.set_page("music")
+    win._reveal_lit_page()
+    assert win.page == "music", "看过的亮起不该反复拽走展开"
+
+    time.sleep(0.01)
+    win.add_notification({"app": "系统", "summary": "更新完成", "body": "",
+                          "at": "10:00"})
+    assert [page for page, _ in win._lit_pages()] == ["tools", "mail"], \
+        "多个亮起时最晚亮起的排前面"
+    win._reveal_lit_page()
+    assert win.page == "tools" and win.tools_page == "notify"
+    assert win._unread == 0
+    assert [page for page, _ in win._lit_pages()] == ["mail"]
+
+    time.sleep(0.01)
+    win._water_pending = True
+    win._mark_lit("water")
+    assert [page for page, _ in win._lit_pages()] == ["water", "mail"]
+    win._reveal_lit_page()
+    assert win.page == "water"
+
+    win._ack_water(False)
+    assert [page for page, _ in win._lit_pages()] == ["mail"]
+
+    # 停在置物架时来通知：展开只切标签，不重开整页
+    win.set_page("tools")
+    win.set_tools_page("shelf")
+    win.add_notification({"app": "系统", "summary": "又来一条", "body": "",
+                          "at": "10:02"})
+    assert win._unread and win.tools_page == "shelf"
+    win._reveal_lit_page()
+    assert win.page == "tools" and win.tools_page == "notify"
+
+    # 人已经在亮起页上：别重开，免得清掉正在看的邮件详情
+    win.set_page("mail")
+    win._mail_detail = 0
+    time.sleep(0.01)
+    win.set_mail({"status": "ok", "unread": 2, "items": [
+        {"sender": "b@example.com", "subject": "第二封", "date": "09:30",
+         "seen": False},
+        {"sender": "a@example.com", "subject": "第一封", "date": "09:00",
+         "seen": False}]})
+    assert [page for page, _ in win._lit_pages()] == ["mail"]
+    win._mail_detail = 1
+    win._reveal_lit_page()
+    assert win.page == "mail" and win._mail_detail == 1
     win.close()
     win.deleteLater()
 
@@ -1852,6 +2096,9 @@ def main() -> int:
     check_todo_dot_needs_confirm()
     check_tools_default_subpage()
     check_tools_notify_dot()
+    check_clipboard_image()
+    check_clip_image_capture()
+    check_lit_page_priority()
     check_notice_pet_clip()
     check_refresh_feedback()
     check_mail_flag_feedback()
